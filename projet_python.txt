@@ -1,0 +1,5716 @@
+### FILE: export_python.py
+import os
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+OUTPUT = os.path.join(ROOT, "projet_python.txt")
+
+EXCLUDE_DIRS = {".git", "venv", "__pycache__"}
+
+with open(OUTPUT, "w", encoding="utf-8") as out:
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        # enlever les dossiers à exclure
+        dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
+
+        for filename in filenames:
+            if not filename.endswith((".py", ".ipynb")):
+                continue
+
+            full_path = os.path.join(dirpath, filename)
+            rel_path = os.path.relpath(full_path, ROOT)
+
+            out.write(f"### FILE: {rel_path}\n")
+            try:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    out.write(f.read())
+            except UnicodeDecodeError:
+                out.write("[UNICODE ERROR: impossible de lire ce fichier]\n")
+
+            out.write("\n\n")
+
+print(f"Export terminé dans {OUTPUT}")
+
+
+### FILE: test2.ipynb
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "5d70c94e",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# -*- coding: utf-8 -*-\n",
+    "\"\"\"\n",
+    "notebook_workflows_simple.py\n",
+    "\n",
+    "Version \"notebook-like\" (linéaire, très simple) :\n",
+    "1) HW 1F : load -> curve -> pricer -> calibrate -> compare plots -> PFE plot\n",
+    "2) HW 2F : load -> curve -> pricer -> calibrate -> compare plots -> PFE plot\n",
+    "\"\"\"\n",
+    "\n",
+    "from pathlib import Path\n",
+    "import sys\n",
+    "import numpy as np\n",
+    "\n",
+    "\n",
+    "# --- imports projet ---\n",
+    "from ir.market.loaders_excel import load_curve_xlsx, load_swaption_template_xlsx\n",
+    "from ir.market.plots import plot_curve, plot_prices_by_tenor, plot_vols_by_tenor\n",
+    "from ir.calibration.vol import black_normal_vol\n",
+    "\n",
+    "from ir.pricers.hw1f_pricer import HullWhitePricer\n",
+    "from ir.calibration.hw1f_calibration import HullWhiteCalibrator\n",
+    "\n",
+    "from ir.pricers.hw2f_pricer import HullWhite2FPricer\n",
+    "from ir.calibration.hw2f_profile import HullWhite2FProfileCalibrator\n",
+    "\n",
+    "from ir.risk.hw2f_sim import HW2FCurveSim\n",
+    "from ir.risk.pfe_swap import pfe_profile_swap\n",
+    "from ir.risk.pfe_plot import plot_pfe_profile\n",
+    "\n",
+    "\n",
+    "# ============================================================\n",
+    "# CONFIG (modifie juste ça)\n",
+    "# ============================================================\n",
+    "CURVE_XLSX = r\"Calibration_Templates\\SWPN_Calibration_Template_30092025_USD.xlsx\"\n",
+    "TEMPLATE_XLSX = CURVE_XLSX\n",
+    "\n",
+    "N_PATHS = 20000\n",
+    "SEED = 2025\n",
+    "\n",
+    "PFE_TAU = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0]\n",
+    "PFE_NOTIONAL = 1_000_000.0\n",
+    "PFE_PAYER = True\n",
+    "PFE_Q = 0.95\n",
+    "PFE_GRID_N = 21\n",
+    "\n",
+    "\n",
+    "# ============================================================\n",
+    "# 2-3 mini helpers (sinon on répète trop)\n",
+    "# ============================================================\n",
+    "def par_rate(curve, Tau):\n",
+    "    Tau = [float(x) for x in Tau]\n",
+    "    T0, Tn = Tau[0], Tau[-1]\n",
+    "    A0 = 0.0\n",
+    "    for i in range(1, len(Tau)):\n",
+    "        Ti = Tau[i]\n",
+    "        d = Tau[i] - Tau[i - 1]\n",
+    "        A0 += d * float(curve.discount(Ti))\n",
+    "    S0 = (float(curve.discount(T0)) - float(curve.discount(Tn))) / (A0 + 1e-18)\n",
+    "    return A0, S0  # annuity, par swap rate\n",
+    "\n",
+    "\n",
+    "def ensure_expiry_tenor(df, dates_col=\"Payment_Dates\"):\n",
+    "    if \"Expiry\" not in df.columns:\n",
+    "        df[\"Expiry\"] = df[dates_col].apply(lambda L: float(L[0]))\n",
+    "    if \"Tenor\" not in df.columns:\n",
+    "        df[\"Tenor\"] = df[dates_col].apply(lambda L: float(L[-1]) - float(L[0]))\n",
+    "\n",
+    "\n",
+    "def add_implied_normal_vols_forward_premium(df, curve,\n",
+    "                                           price_col=\"Price\",\n",
+    "                                           model_col=\"Model_Price\",\n",
+    "                                           strike_col=\"Strike\",\n",
+    "                                           dates_col=\"Payment_Dates\"):\n",
+    "    # Convention: forward premium = PV / DF(T0)\n",
+    "    mkt_vol, mdl_vol = [], []\n",
+    "    for _, row in df.iterrows():\n",
+    "        Tau = row[dates_col]\n",
+    "        T0 = float(Tau[0])\n",
+    "        DF0 = float(curve.discount(T0))\n",
+    "        A0, S0 = par_rate(curve, Tau)\n",
+    "        annuity_fwd = A0 / (DF0 + 1e-18)\n",
+    "\n",
+    "        strike_pct = float(row[strike_col])      # %\n",
+    "        forward_pct = 100.0 * float(S0)          # %\n",
+    "        notional = float(row.get(\"Notional\", 1.0))\n",
+    "\n",
+    "        p_mkt = float(row[price_col])\n",
+    "        p_mdl = float(row[model_col])\n",
+    "\n",
+    "        mkt_vol.append(black_normal_vol(p_mkt, forward_pct, strike_pct, T0, notional, annuity_fwd))\n",
+    "        mdl_vol.append(black_normal_vol(p_mdl, forward_pct, strike_pct, T0, notional, annuity_fwd))\n",
+    "\n",
+    "    df[\"Market_Vol (Bps)\"] = mkt_vol\n",
+    "    df[\"Model_Vol (Bps)\"] = mdl_vol\n",
+    "\n",
+    "\n",
+    "\n",
+    "# ============================================================\n",
+    "# 1) LOAD DATA\n",
+    "# ============================================================\n",
+    "print(\"\\n=== LOAD curve + swaptions template ===\")\n",
+    "curve = load_curve_xlsx(CURVE_XLSX)\n",
+    "swpn = load_swaption_template_xlsx(TEMPLATE_XLSX)\n",
+    "\n",
+    "plot_curve(curve, title_prefix=\"Market\")\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "459c8d33",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\n",
+    "# ============================================================\n",
+    "# 2) HW 1F : pricer -> calibrate -> compare -> PFE\n",
+    "# ============================================================\n",
+    "print(\"\\n\" + \"=\" * 80)\n",
+    "print(\"HW 1F\")\n",
+    "print(\"=\" * 80)\n",
+    "\n",
+    "print(\"[1F] init pricer\")\n",
+    "pricer_1f = HullWhitePricer(curve, n_paths=N_PATHS, seed=SEED)\n",
+    "\n",
+    "print(\"[1F] calibrate (a,sigma) on swaptions (forward premium)\")\n",
+    "mkt_dict = swpn.to_market_dict()\n",
+    "cal_1f = HullWhiteCalibrator(pricer_1f, mkt_dict, calibrate_to=\"Swaptions\")\n",
+    "cal_1f.calibrate(init_a=0.01, init_sigma=0.01)\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "ba0dc988",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\n",
+    "print(\"[1F] compare market vs model (plots)\")\n",
+    "df_1f = swpn.with_model_prices_1f(pricer_1f, forward_premium=True)\n",
+    "ensure_expiry_tenor(df_1f)\n",
+    "\n",
+    "plot_prices_by_tenor(df_1f, mkt_col=\"Price\", model_col=\"Model_Price\", ylabel=\"Forward Premium\")\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "819becc4",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\n",
+    "add_implied_normal_vols_forward_premium(df_1f, curve)\n",
+    "plot_vols_by_tenor(df_1f,\n",
+    "                   mkt_col=\"Market_Vol (Bps)\",\n",
+    "                   model_col=\"Model_Vol (Bps)\",\n",
+    "                   ylabel=\"Normal Vol (Bps)\",\n",
+    "                   title=\"HW1F | Swaption Normal Vols (implied, forward premium)\")\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 20,
+   "id": "aca88566",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[1F] PFE (swap)\n"
+     ]
+    }
+   ],
+   "source": [
+    "\n",
+    "print(\"[1F] PFE (swap)\")\n",
+    "A0, K_par = par_rate(curve, PFE_TAU)\n",
+    "grid = np.linspace(0.0, float(PFE_TAU[-1]), int(PFE_GRID_N))\n",
+    "\n",
+    "pfe_1f, epe_1f = pfe_profile_swap(\n",
+    "    curve_sim=pricer_1f.curve_sim,\n",
+    "    grid=grid,\n",
+    "    Tau=PFE_TAU,\n",
+    "    K=0.03,\n",
+    "    N=PFE_NOTIONAL,\n",
+    "    payer=PFE_PAYER,\n",
+    "    q=PFE_Q,\n",
+    ")\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "f205ee03",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\n",
+    "# subtitle_1f = f\"Tau={PFE_TAU} | N={PFE_NOTIONAL:,.0f} | K(par)={K_par*100:.3f}% | params={pricer_1f.model.parameters}\"\n",
+    "plot_pfe_profile(grid, pfe_1f, epe=epe_1f, q=PFE_Q, title=\"HW1F | PFE profile (swap)\")\n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "f7a58b9f",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\n",
+    "# ============================================================\n",
+    "# 3) HW 2F : pricer -> calibrate -> compare -> PFE\n",
+    "# ============================================================\n",
+    "print(\"\\n\" + \"=\" * 80)\n",
+    "print(\"HW 2F (G2++)\")\n",
+    "print(\"=\" * 80)\n",
+    "\n",
+    "print(\"[2F] init pricer\")\n",
+    "pricer_2f = HullWhite2FPricer(curve)\n",
+    "\n",
+    "print(\"[2F] calibrate profile on swaptions (forward premium)\")\n",
+    "cal_2f = HullWhite2FProfileCalibrator(pricer_2f, mkt_dict, use_forward_premium=True)\n",
+    "\n",
+    "# grids \"petites\" (lisible). Tu élargiras ensuite.\n",
+    "grid_a = [0.01, 0.02, 0.05, 0.10, 0.20]\n",
+    "grid_b = [0.001, 0.003, 0.01, 0.02, 0.05]\n",
+    "grid_rho = [-0.8, -0.5, -0.2, 0.0, 0.2]\n",
+    "\n",
+    "cal_2f.calibrate_profile(\n",
+    "    grid_a=grid_a,\n",
+    "    grid_b=grid_b,\n",
+    "    grid_rho=grid_rho,\n",
+    "    init_sigma=0.01,\n",
+    "    init_eta=0.008,\n",
+    "    verbose_inner=False,\n",
+    "    top_k=3,\n",
+    ")\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "4ad88dcc",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\n",
+    "print(\"[2F] compare market vs model (plots)\")\n",
+    "df_2f = swpn.with_model_prices_2f(pricer_2f, forward_premium=True)\n",
+    "ensure_expiry_tenor(df_2f)\n",
+    "\n",
+    "plot_prices_by_tenor(df_2f, mkt_col=\"Price\", model_col=\"Model_Price\", ylabel=\"Forward Premium\")\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "0ad3e640",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\n",
+    "add_implied_normal_vols_forward_premium(df_2f, curve)\n",
+    "plot_vols_by_tenor(df_2f,\n",
+    "                   mkt_col=\"Market_Vol (Bps)\",\n",
+    "                   model_col=\"Model_Vol (Bps)\",\n",
+    "                   ylabel=\"Normal Vol (Bps)\",\n",
+    "                   title=\"HW2F | Swaption Normal Vols (implied, forward premium)\")\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 25,
+   "id": "8353d65c",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[2F] PFE (swap)\n"
+     ]
+    }
+   ],
+   "source": [
+    "\n",
+    "print(\"[2F] PFE (swap)\")\n",
+    "curve_sim_2f = HW2FCurveSim(\n",
+    "    curve=curve,\n",
+    "    model=pricer_2f.model,\n",
+    "    n_paths=N_PATHS,\n",
+    "    seed=SEED,\n",
+    "    use_legacy_global_seed=True,\n",
+    ")\n",
+    "\n",
+    "pfe_2f, epe_2f = pfe_profile_swap(\n",
+    "    curve_sim=curve_sim_2f,\n",
+    "    grid=grid,\n",
+    "    Tau=PFE_TAU,\n",
+    "    K=0.03,\n",
+    "    N=PFE_NOTIONAL,\n",
+    "    payer=PFE_PAYER,\n",
+    "    q=PFE_Q,\n",
+    ")\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "bc0a644f",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\n",
+    "# subtitle_2f = f\"Tau={PFE_TAU} | N={PFE_NOTIONAL:,.0f} | K(par)={K_par*100:.3f}% | params={pricer_2f.model.parameters}\"\n",
+    "plot_pfe_profile(grid, pfe_2f, epe=epe_2f, q=PFE_Q, title=\"HW2F | PFE profile (swap)\")\n"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.11.5"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
+
+
+### FILE: ir\calibration\hw1f_calibration.py
+from scipy.optimize import minimize, brentq
+import numpy as np
+from scipy.stats import norm
+import itertools
+from typing import Callable, Optional, Dict, Any
+
+
+class HullWhiteCalibrator:
+    """
+    Calibrates Hull–White 1F parameters (a, sigma) using market prices of Caplets or Swaptions.
+
+    Notes
+    -----
+    - Uses log-parameterization to enforce positivity: a = exp(x[0]), sigma = exp(x[1]).
+    - Objective: RMSRE (root mean squared relative error) on prices (or forward premiums for swaptions).
+    - Keeps detailed prints (callback + final per-instrument report) like your original code.
+
+    Patch (Streamlit progress)
+    --------------------------
+    - progress_cb: callable optional called at each optimizer iteration (via callback).
+      It receives a dict: {"iter": int, "a": float, "sigma": float, "rmsre": float}
+    """
+
+    def __init__(
+        self,
+        pricer,
+        market_prices,
+        calibrate_to="Caplets",
+        progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,  # NEW
+    ):
+        self.pricer = pricer
+        self.model = pricer.model
+        self.market_prices = market_prices
+        self.calibrate_to = calibrate_to
+        self.history = []  # stores tuples (a, sigma, rmsre)
+
+        self.progress_cb = progress_cb  # NEW
+        self._cb_iter = 0  # NEW: true optimizer-iteration counter (callback count)
+
+    # -------- internal helpers -------- #
+
+    def _set_params(self, a: float, sigma: float) -> None:
+        self.model.parameters["a"] = float(a)
+        self.model.parameters["sigma"] = float(sigma)
+
+    def _price_instrument(self, i: int) -> float:
+        """
+        Returns model price (or forward premium for swaptions) for instrument i,
+        using current model parameters (a, sigma).
+        """
+        K = self.market_prices["Strike"][i] / 100.0
+        N = self.market_prices["Notional"][i]
+
+        if self.calibrate_to == "Caplets":
+            T = self.market_prices["Expiry"][i]
+            S = self.market_prices["Maturity"][i]
+            return self.pricer.caplet(T, S, N, K)
+
+        elif self.calibrate_to == "Swaptions":
+            Tau = self.market_prices["Dates"][i]
+            DF = self.pricer.curve.discount(Tau[0])
+            # Forward premium consistency: ensure market_prices['Prices'] matches this convention.
+            return self.pricer.swaption(Tau, N, K) / DF
+
+        raise ValueError("Calibration only implemented for 'Caplets' and 'Swaptions'.")
+
+    # -------- optimization objective + callback -------- #
+
+    def objective(self, x):
+        """
+        Objective function J(x) where x = (log(a), log(sigma)).
+        Returns RMSRE over instruments.
+
+        RMSRE = sqrt( (1/n) * sum_i ((model_i - mkt_i)^2 / (mkt_i^2 + eps)) )
+        """
+        a = np.exp(x[0])
+        sigma = np.exp(x[1])
+        self._set_params(a, sigma)
+
+        prices = self.market_prices["Prices"]
+        n = len(prices)
+        eps = 1e-6
+
+        err = 0.0
+        for i in range(n):
+            market_price = prices[i]
+            model_price = self._price_instrument(i)
+            err += (1.0 / n) * ((model_price - market_price) ** 2) / (market_price**2 + eps)
+
+        rmsre = float(np.sqrt(err))
+        self.history.append((a, sigma, rmsre))
+        return rmsre
+
+    def callback(self, x):
+        """
+        Print current (a, sigma) and error during optimization (like your original callback).
+        Also calls progress_cb if provided (for Streamlit live UI).
+        """
+        if not self.history:
+            return
+
+        self._cb_iter += 1  # NEW
+        a, sigma, err = self.history[-1]
+
+        # keep your console print (capturable by your capture_stdout)
+        print(f"a: {a:.6f}, sigma: {sigma:.6f}, RMSRE: {err:.5e}")
+
+        # NEW: Streamlit/UI hook (safe)
+        if self.progress_cb is not None:
+            try:
+                self.progress_cb(
+                    {
+                        "iter": int(self._cb_iter),
+                        "a": float(a),
+                        "sigma": float(sigma),
+                        "rmsre": float(err),
+                    }
+                )
+            except Exception:
+                # Do NOT break optimization if UI update fails
+                pass
+
+    # -------- main entry point -------- #
+
+    def calibrate(
+        self,
+        init_a=0.01,
+        init_sigma=0.01,
+        bounds_a=(1e-4, 1.0),
+        bounds_sigma=(1e-4, 0.5),
+        method="L-BFGS-B",
+        ftol=1e-6,
+    ):
+        """
+        Run optimization to calibrate both a and sigma.
+
+        Returns
+        -------
+        scipy.optimize.OptimizeResult
+        """
+        # reset callback iteration counter for each run
+        self._cb_iter = 0
+
+        # log-space init + bounds
+        x0 = np.log([init_a, init_sigma])
+        bounds = [
+            (np.log(bounds_a[0]), np.log(bounds_a[1])),
+            (np.log(bounds_sigma[0]), np.log(bounds_sigma[1])),
+        ]
+
+        result = minimize(
+            self.objective,
+            x0,
+            bounds=bounds,
+            method=method,
+            callback=self.callback,
+            options={"ftol": ftol},
+        )
+
+        if result.success:
+            a_opt = float(np.exp(result.x[0]))
+            sigma_opt = float(np.exp(result.x[1]))
+            self._set_params(a_opt, sigma_opt)
+
+            print("\nCalibration successful:")
+            print(f"Iterations: {result.nit}")
+            print(f"Number of instruments: {len(self.market_prices['Prices'])}")
+            print(f"Total Error (RMSRE): {result.fun:>+8.3%}\n")
+            print("Parameters:")
+            print(f"Optimal a: {a_opt:.6f}")
+            print(f"Optimal sigma: {sigma_opt:.6f}\n")
+
+            # Per-instrument report
+            for i in range(len(self.market_prices["Prices"])):
+                market_price = self.market_prices["Prices"][i]
+                model_price = self._price_instrument(i)
+                dif = model_price / (market_price + 1e-12) - 1.0
+
+                if self.calibrate_to == "Caplets":
+                    T = self.market_prices["Expiry"][i]
+                    S = self.market_prices["Maturity"][i]
+                    print(
+                        f"Caplet {i:>2}: {T:>5.2f}Y to {S:<5.2f}Y | "
+                        f"Model: {model_price:>8.2f} | Market: {market_price:>8.2f} | Diff: {dif:>+8.3%}"
+                    )
+
+                elif self.calibrate_to == "Swaptions":
+                    Tau = self.market_prices["Dates"][i]
+                    print(
+                        f"Swaption {i:>3}: {Tau[0]:>5.2f}Y to {Tau[-1]:<5.2f}Y | "
+                        f"Model: {model_price:>8.2f} | Market: {market_price:>8.2f} | Diff: {dif:>+8.3%}"
+                    )
+
+        else:
+            print("Calibration failed:", result.message)
+
+        return result
+
+
+### FILE: ir\calibration\hw2f_profile.py
+from __future__ import annotations
+
+from scipy.optimize import minimize, brentq
+import numpy as np
+from scipy.stats import norm
+import itertools
+from typing import Callable, Optional
+
+
+class HullWhite2FProfileCalibrator:
+    """
+    Profile calibration of Hull-White 2F (G2++) parameters on swaptions
+    using the Gaussian swap-rate approximation + Bachelier pricing.
+
+    Outer loop : (a, b, rho)
+    Inner loop : (sigma, eta)
+
+    Market data expected in market_prices:
+        - "Prices": list[float]  (PV or forward premium, see use_forward_premium)
+        - "Strike": list[float]  (in % like your current calibrator, will be /100)
+        - "Notional": list[float]
+        - "Dates": list[list[float]]  where Dates[i] = [T0, T1, ..., Tn]
+
+    Options
+    -------
+    use_forward_premium : bool
+        If True, compare model_price / DF(T0) to market price (matches your 1F "Swaptions" convention).
+        If False, compare PV directly.
+    payer : bool
+        Assume payer swaption for all instruments, unless you supply "Payer" in market_prices.
+
+    progress_cb : Optional[Callable[[dict], None]]
+        If provided, called during the outer loop to report progress.
+        Typical payload:
+          - stage: "outer_start" | "outer_done"
+          - outer_idx, outer_total
+          - a, b, rho
+          - cand_rmsre (on "outer_done")
+          - best_rmsre (best so far)
+          - improved (on "outer_done")
+    """
+
+    def __init__(
+        self,
+        pricer,
+        market_prices,
+        use_forward_premium=True,
+        progress_cb: Optional[Callable[[dict], None]] = None,
+    ):
+        self.pricer = pricer
+        self.model = pricer.model
+        self.curve = pricer.curve
+        self.market_prices = market_prices
+        self.use_forward_premium = bool(use_forward_premium)
+
+        # NEW: UI callback (Streamlit progress, etc.)
+        self.progress_cb = progress_cb
+
+        # optional per-instrument payer flags
+        self.has_payer_flags = ("Payer" in market_prices)
+
+        # histories
+        self.outer_history = []  # stores dicts with (a,b,rho,sigma,eta,rmsre)
+        self.inner_history = []  # stores tuples (sigma, eta, rmsre) for current outer loop
+
+        # Precompute instrument static objects (do not depend on a,b,rho,sigma,eta)
+        self._instr = self._precompute_instruments()
+
+    # -------------------------
+    # Model parameter management
+    # -------------------------
+
+    def _set_params(self, a, b, rho, sigma, eta):
+        self.model.parameters["a"] = float(a)
+        self.model.parameters["b"] = float(b)
+        self.model.parameters["rho"] = float(rho)
+        self.model.parameters["sigma"] = float(sigma)
+        self.model.parameters["eta"] = float(eta)
+
+    # -------------------------
+    # Precomputation per swaption
+    # -------------------------
+
+    def _annuity_and_swap_rate_0(self, Tau):
+        """
+        Same conventions as your pricer:
+          Delta_i = Tau[i] - Tau[i-1]
+          A0 = sum Delta_i P(0,Ti)
+          S0 = (P(0,T0) - P(0,Tn)) / A0
+        """
+        T0 = float(Tau[0])
+        Tn = float(Tau[-1])
+
+        A0 = 0.0
+        for i in range(1, len(Tau)):
+            Ti = float(Tau[i])
+            delta = float(Tau[i] - Tau[i - 1])
+            A0 += delta * self.curve.discount(Ti)
+
+        if A0 <= 0:
+            raise ValueError("Annuity A0 must be > 0.")
+
+        S0 = (self.curve.discount(T0) - self.curve.discount(Tn)) / A0
+        return float(A0), float(S0)
+
+    def _frozen_weights(self, Tau, A0, S0):
+        """
+        Build frozen weights c for U = Tau:
+          c[T0] += P(0,T0)/A0
+          c[Tn] += -P(0,Tn)/A0
+          c[Ti] += -(S0/A0) * Delta_i * P(0,Ti), i=1..n
+        """
+        U = [float(x) for x in Tau]
+        m = len(U)
+        c = np.zeros(m, dtype=float)
+
+        # numerator
+        c[0] += self.curve.discount(U[0]) / A0
+        c[-1] += -self.curve.discount(U[-1]) / A0
+
+        # annuity
+        for i in range(1, m):
+            Ti = U[i]
+            delta = U[i] - U[i - 1]
+            c[i] += -(S0 / A0) * delta * self.curve.discount(Ti)
+
+        return U, c
+
+    def _precompute_instruments(self):
+        """
+        Precompute, for each swaption i:
+          - Tau, U, c
+          - expiry T, DF(T)
+          - A0, S0
+          - K (rate units), N
+          - market price
+          - payer flag (if provided)
+        """
+        prices = self.market_prices["Prices"]
+        strikes = self.market_prices["Strike"]
+        notionals = self.market_prices["Notional"]
+        dates = self.market_prices["Dates"]
+
+        n = len(prices)
+        instr = []
+
+        for i in range(n):
+            Tau = [float(x) for x in dates[i]]
+            if len(Tau) < 2:
+                raise ValueError(f"Instrument {i}: Tau must contain at least [T0, Tn].")
+
+            T = float(Tau[0])
+            DF = float(self.curve.discount(T))
+
+            A0, S0 = self._annuity_and_swap_rate_0(Tau)
+            U, c = self._frozen_weights(Tau, A0, S0)
+
+            K = float(strikes[i]) / 100.0
+            N = float(notionals[i])
+            mkt = float(prices[i])
+
+            payer = True
+            if self.has_payer_flags:
+                payer = bool(self.market_prices["Payer"][i])
+
+            instr.append(
+                {
+                    "Tau": Tau,
+                    "U": U,
+                    "c": c,
+                    "T": T,
+                    "DF": DF,
+                    "A0": A0,
+                    "S0": S0,
+                    "K": K,
+                    "N": N,
+                    "mkt": mkt,
+                    "payer": payer,
+                }
+            )
+
+        return instr
+
+    # -------------------------
+    # Outer-dependent Q's
+    # -------------------------
+
+    def _compute_Qs_for_outer(self, a, b):
+        """
+        For current outer (a,b), compute Qaa, Qbb, Qab for each instrument:
+            Qaa = c^T I_aa c, etc.
+
+        Uses the closed-form integrals implemented in HullWhite2FModel via the pricer/model.
+        """
+        Qaa = np.zeros(len(self._instr), dtype=float)
+        Qbb = np.zeros(len(self._instr), dtype=float)
+        Qab = np.zeros(len(self._instr), dtype=float)
+
+        I_aa = self.model.__class__.I_aa if hasattr(self.model.__class__, "I_aa") else None
+        I_bb = self.model.__class__.I_bb if hasattr(self.model.__class__, "I_bb") else None
+        I_ab = self.model.__class__.I_ab if hasattr(self.model.__class__, "I_ab") else None
+
+        if I_aa is None or I_bb is None or I_ab is None:
+            from models.hw2f import HullWhite2FModel
+            I_aa = HullWhite2FModel.I_aa
+            I_bb = HullWhite2FModel.I_bb
+            I_ab = HullWhite2FModel.I_ab
+
+        for k, ins in enumerate(self._instr):
+            T = ins["T"]
+            U = ins["U"]
+            c = ins["c"]
+
+            qaa = 0.0
+            qbb = 0.0
+            qab = 0.0
+
+            for i, Ui in enumerate(U):
+                ci = c[i]
+                if ci == 0.0:
+                    continue
+                for j, Uj in enumerate(U):
+                    cj = c[j]
+                    if cj == 0.0:
+                        continue
+                    qaa += ci * cj * I_aa(T, Ui, Uj, a)
+                    qbb += ci * cj * I_bb(T, Ui, Uj, b)
+                    qab += ci * cj * I_ab(T, Ui, Uj, a, b)
+
+            Qaa[k] = qaa
+            Qbb[k] = qbb
+            Qab[k] = qab
+
+        return Qaa, Qbb, Qab
+
+    # -------------------------
+    # Inner objective (sigma, eta)
+    # -------------------------
+
+    def _price_swaption_from_Qs(self, ins, rho, sigma, eta, qaa, qbb, qab):
+        """
+        Fast pricing using precomputed Q's:
+          Var[S(T)] = sigma^2 qaa + eta^2 qbb + 2 rho sigma eta qab
+          Bachelier on swap rate with annuity A0 and forward S0
+        """
+        T = ins["T"]
+        A0 = ins["A0"]
+        S0 = ins["S0"]
+        K = ins["K"]
+        N = ins["N"]
+        payer = ins["payer"]
+
+        varS = (sigma * sigma) * qaa + (eta * eta) * qbb + 2.0 * rho * sigma * eta * qab
+        varS = float(max(varS, 0.0))
+
+        w = 1.0 if payer else -1.0
+
+        if T <= 0:
+            return float(N * A0 * max(w * (S0 - K), 0.0))
+
+        if varS < 1e-30:
+            return float(N * A0 * max(w * (S0 - K), 0.0))
+
+        sigmaN = np.sqrt(varS / T)
+        d = (S0 - K) / (sigmaN * np.sqrt(T))
+
+        price = N * A0 * (w * (S0 - K) * norm.cdf(w * d) + sigmaN * np.sqrt(T) * norm.pdf(d))
+        return float(price)
+
+    def _inner_objective(self, x, rho, Qaa, Qbb, Qab):
+        """
+        x = (log sigma, log eta). Returns RMSRE on prices or forward premiums.
+        """
+        sigma = float(np.exp(x[0]))
+        eta = float(np.exp(x[1]))
+
+        eps = 1e-6
+        n = len(self._instr)
+
+        err = 0.0
+        for k, ins in enumerate(self._instr):
+            model_pv = self._price_swaption_from_Qs(ins, rho, sigma, eta, Qaa[k], Qbb[k], Qab[k])
+
+            if self.use_forward_premium:
+                model_val = model_pv / (ins["DF"] + 1e-18)
+            else:
+                model_val = model_pv
+
+            mkt = ins["mkt"]
+            err += (1.0 / n) * ((model_val - mkt) ** 2) / (mkt * mkt + eps)
+
+        rmsre = float(np.sqrt(err))
+        self.inner_history.append((sigma, eta, rmsre))
+        return rmsre
+
+    def _inner_callback(self, x):
+        if not self.inner_history:
+            return
+        sigma, eta, err = self.inner_history[-1]
+        print(f"    sigma: {sigma:.6f}, eta: {eta:.6f}, RMSRE: {err:.5e}")
+
+    def _run_inner_calibration(
+        self,
+        rho,
+        Qaa,
+        Qbb,
+        Qab,
+        init_sigma=0.01,
+        init_eta=0.008,
+        bounds_sigma=(1e-4, 0.5),
+        bounds_eta=(1e-4, 0.5),
+        method="L-BFGS-B",
+        ftol=1e-6,
+        verbose=False,
+    ):
+        """
+        Calibrate (sigma, eta) for fixed rho and precomputed Q's.
+        """
+        self.inner_history = []
+
+        x0 = np.log([init_sigma, init_eta])
+        bounds = [
+            (np.log(bounds_sigma[0]), np.log(bounds_sigma[1])),
+            (np.log(bounds_eta[0]), np.log(bounds_eta[1])),
+        ]
+
+        cb = self._inner_callback if verbose else None
+
+        res = minimize(
+            lambda x: self._inner_objective(x, rho, Qaa, Qbb, Qab),
+            x0,
+            bounds=bounds,
+            method=method,
+            callback=cb,
+            options={"ftol": ftol},
+        )
+
+        sigma_opt = float(np.exp(res.x[0]))
+        eta_opt = float(np.exp(res.x[1]))
+        return res, sigma_opt, eta_opt
+
+    # -------------------------
+    # Public API: Profile calibration
+    # -------------------------
+
+    def calibrate_profile(
+        self,
+        # outer grid
+        grid_a=None,
+        grid_b=None,
+        grid_rho=None,
+        # inner init/bounds
+        init_sigma=0.01,
+        init_eta=0.008,
+        bounds_sigma=(1e-4, 0.5),
+        bounds_eta=(1e-4, 0.5),
+        # optim settings
+        inner_method="L-BFGS-B",
+        inner_ftol=1e-6,
+        verbose_inner=False,
+        top_k=3,
+    ):
+        """
+        Run profile calibration:
+          - Evaluate a grid of (a,b,rho)
+          - For each, compute Q's and calibrate (sigma,eta)
+          - Keep best result
+
+        Returns
+        -------
+        dict with best parameters and error.
+        """
+        if grid_a is None:
+            grid_a = [0.01, 0.02, 0.05, 0.10, 0.20, 0.30]
+        if grid_b is None:
+            grid_b = [0.001, 0.003, 0.01, 0.02, 0.05, 0.10]
+        if grid_rho is None:
+            grid_rho = [-0.95, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4]
+
+        # ensure b < a (common identification)
+        outer_candidates = []
+        for a, b, rho in itertools.product(grid_a, grid_b, grid_rho):
+            if b < a:
+                outer_candidates.append((float(a), float(b), float(rho)))
+
+        if not outer_candidates:
+            raise ValueError("Empty outer grid after applying constraint b < a.")
+
+        outer_total = len(outer_candidates)
+
+        print(f"Profile calibration on {len(self._instr)} swaptions.")
+        print(f"Outer grid candidates: {outer_total}")
+
+        results = []
+        best_rmsre = float("inf")
+
+        for idx, (a, b, rho) in enumerate(outer_candidates, start=1):
+            # --- progress: candidate start ---
+            if self.progress_cb is not None:
+                try:
+                    self.progress_cb(
+                        {
+                            "stage": "outer_start",
+                            "outer_idx": int(idx),
+                            "outer_total": int(outer_total),
+                            "a": float(a),
+                            "b": float(b),
+                            "rho": float(rho),
+                            "best_rmsre": None if best_rmsre == float("inf") else float(best_rmsre),
+                        }
+                    )
+                except Exception:
+                    # never break calibration due to UI callback
+                    pass
+
+            # set outer params (sigma,eta will be set by inner)
+            print(f"\n[Outer {idx}/{outer_total}] a={a:.4f}, b={b:.4f}, rho={rho:+.2f}")
+
+            # update model outer params before computing Q's
+            self.model.parameters["a"] = a
+            self.model.parameters["b"] = b
+            self.model.parameters["rho"] = rho
+
+            # compute Q's for this (a,b)
+            Qaa, Qbb, Qab = self._compute_Qs_for_outer(a, b)
+
+            # inner calibration on (sigma,eta)
+            res_in, sigma_opt, eta_opt = self._run_inner_calibration(
+                rho=rho,
+                Qaa=Qaa,
+                Qbb=Qbb,
+                Qab=Qab,
+                init_sigma=init_sigma,
+                init_eta=init_eta,
+                bounds_sigma=bounds_sigma,
+                bounds_eta=bounds_eta,
+                method=inner_method,
+                ftol=inner_ftol,
+                verbose=verbose_inner,
+            )
+
+            rmsre = float(res_in.fun)
+            print(f"  -> inner best: sigma={sigma_opt:.6f}, eta={eta_opt:.6f}, RMSRE={rmsre:.5e}")
+
+            improved = rmsre < best_rmsre
+            if improved:
+                best_rmsre = rmsre
+
+            # --- progress: candidate done ---
+            if self.progress_cb is not None:
+                try:
+                    self.progress_cb(
+                        {
+                            "stage": "outer_done",
+                            "outer_idx": int(idx),
+                            "outer_total": int(outer_total),
+                            "a": float(a),
+                            "b": float(b),
+                            "rho": float(rho),
+                            "cand_rmsre": float(rmsre),
+                            "best_rmsre": float(best_rmsre),
+                            "improved": bool(improved),
+                        }
+                    )
+                except Exception:
+                    pass
+
+            results.append(
+                {
+                    "a": a,
+                    "b": b,
+                    "rho": rho,
+                    "sigma": sigma_opt,
+                    "eta": eta_opt,
+                    "rmsre": rmsre,
+                    "inner_result": res_in,
+                }
+            )
+
+        # sort by error
+        results.sort(key=lambda d: d["rmsre"])
+        best = results[0]
+
+        # set final params in model
+        self._set_params(best["a"], best["b"], best["rho"], best["sigma"], best["eta"])
+
+        print("\n=== Profile calibration result (best) ===")
+        print(f"Total Error (RMSRE): {best['rmsre']:>+8.3%}")
+        print("Parameters:")
+        print(f"  a    : {best['a']:.6f}")
+        print(f"  b    : {best['b']:.6f}")
+        print(f"  rho  : {best['rho']:+.6f}")
+        print(f"  sigma: {best['sigma']:.6f}")
+        print(f"  eta  : {best['eta']:.6f}")
+
+        print("\nPer-instrument report:")
+
+        # Recompute Qs for best (a,b)
+        Qaa_best, Qbb_best, Qab_best = self._compute_Qs_for_outer(best["a"], best["b"])
+
+        rho = best["rho"]
+        sigma = best["sigma"]
+        eta = best["eta"]
+
+        for k, ins in enumerate(self._instr):
+            model_pv = self._price_swaption_from_Qs(ins, rho, sigma, eta, Qaa_best[k], Qbb_best[k], Qab_best[k])
+
+            if self.use_forward_premium:
+                model_val = model_pv / (ins["DF"] + 1e-18)
+            else:
+                model_val = model_pv
+
+            mkt = ins["mkt"]
+            dif = model_val / (mkt + 1e-12) - 1.0
+
+            Tau = ins["Tau"]
+            print(
+                f"Swaption {k:>3}: {Tau[0]:>5.2f}Y to {Tau[-1]:<5.2f}Y | "
+                f"Model: {model_val:>10.4f} | Market: {mkt:>10.4f} | Diff: {dif:>+8.3%}"
+            )
+
+        # Print top_k candidates summary
+        if top_k and top_k > 1:
+            print(f"\nTop {min(top_k, len(results))} candidates:")
+            for j in range(min(top_k, len(results))):
+                r = results[j]
+                print(
+                    f"  {j+1:>2}. a={r['a']:.4f}, b={r['b']:.4f}, rho={r['rho']:+.2f} | "
+                    f"sigma={r['sigma']:.5f}, eta={r['eta']:.5f} | RMSRE={r['rmsre']:.5e}"
+                )
+
+        # Return best + full ranking
+        return {"best": best, "ranking": results}
+
+
+### FILE: ir\calibration\vol.py
+from scipy.optimize import minimize, brentq
+import numpy as np
+from scipy.stats import norm 
+import itertools
+
+
+# Bachelier (normal) vol from price
+def black_normal_vol(price, forward, strike, expiry, notional, annuity):
+    """
+    Computes the normal (Bachelier) implied volatility (in basis points) from a swaption or caplet price.
+
+    Parameters
+    ----------
+    price : float
+        Market price of the swaption or caplet.
+    forward : float
+        Forward swap rate.
+    strike : float
+        Swaption strike rate.
+    expiry : float
+        Time to expiry in years.
+    notional : float
+        Notional amount of the swaption or caplet.
+    annuity : float
+        Annuity factor for the swaption or caplet (DF x Year Frac.).
+
+    Returns
+    -------
+    float
+        Implied normal volatility in basis points (bps).
+    """
+    forward = forward / 100  # convert percentage to rate units
+    strike = strike / 100    # convert percentage to rate units
+
+    def bachelier_price(sigma):
+        if sigma <= 0:
+            return 0.0
+        d = (forward - strike) / (sigma * np.sqrt(expiry))
+        price_model = annuity * notional * ((forward - strike) * norm.cdf(d) + sigma * np.sqrt(expiry) * norm.pdf(d))
+        return price_model
+
+    def objective(sigma):
+        return bachelier_price(sigma) - price
+
+    # Reasonable bounds for normal vols (in rate units)
+    try:
+        sigma_normal = brentq(objective, 1e-6, 5.0)
+        
+    except ValueError as e:
+        sigma_normal = np.nan
+        print(f"Warning: Could not solve for vol: {e}")
+    return sigma_normal * 10000  # convert to bps
+
+### FILE: ir\instruments\base.py
+# -*- coding: utf-8 -*-
+"""
+ir/instruments/base.py
+
+Couche "métier" légère:
+- Instrument (base) : wrapper pour pricing (sans toucher aux formules)
+- QuoteSet : encapsule un DataFrame et sait produire les dicts attendus par tes calibrators
+- SwaptionQuoteSet / CapletQuoteSet : implémentations concrètes
+
+But:
+- réduire drastiquement le glue-code notebook
+- garder tes calibrators/pricers inchangés
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional, Any
+
+import numpy as np
+import pandas as pd
+
+
+# -------------------------
+# Instruments (base)
+# -------------------------
+
+@dataclass(frozen=True)
+class Instrument:
+    """Instrument abstrait: seulement une API commune."""
+    def price(self, pricer: Any) -> float:
+        raise NotImplementedError
+
+
+# -------------------------
+# QuoteSets (calibration / comparaison)
+# -------------------------
+
+@dataclass
+class QuoteSet:
+    """
+    Base class: wraps a DataFrame and defines a standard interface.
+
+    df is expected to contain at least the columns referenced by *_col attributes.
+    """
+    df: pd.DataFrame
+
+    def copy_df(self) -> pd.DataFrame:
+        return self.df.copy(deep=True)
+
+
+@dataclass
+class SwaptionQuoteSet(QuoteSet):
+    """
+    Wrap swaption calibration template.
+
+    Required columns:
+      - price_col, strike_col, notional_col, dates_col
+    Optional:
+      - payer_col (bool)
+    """
+    price_col: str = "Price"
+    strike_col: str = "Strike"
+    notional_col: str = "Notional"
+    dates_col: str = "Payment_Dates"
+    payer_col: Optional[str] = None
+
+    def to_market_dict(self) -> dict:
+        """
+        Dict EXACT attendu par tes calibrators (1F & 2F profile):
+          Prices, Strike, Notional, Dates (+ optional Payer)
+        Strike is kept in % (calibrator divides by 100 itself for 1F and 2F profile).
+        """
+        d = {
+            "Prices": self.df[self.price_col].astype(float).tolist(),
+            "Strike": self.df[self.strike_col].astype(float).tolist(),
+            "Notional": self.df[self.notional_col].astype(float).tolist(),
+            "Dates": self.df[self.dates_col].tolist(),  # list[list[float]]
+        }
+        if self.payer_col and self.payer_col in self.df.columns:
+            d["Payer"] = self.df[self.payer_col].astype(bool).tolist()
+        return d
+
+    # ---- comparaison mkt vs modèle (pricing) ---- #
+
+    def with_model_prices_1f(self, pricer: Any, forward_premium: bool = True, payer_default: bool = True) -> pd.DataFrame:
+        """
+        Compute model prices for ALL rows using HW1F pricer.
+
+        - If forward_premium=True: return PV/DF(T0) (matches your notebook & calibrator convention)
+        - Else: return PV
+        """
+        out = self.copy_df()
+        model_prices = []
+
+        for i in range(len(out)):
+            Tau = out.loc[i, self.dates_col]
+            N = float(out.loc[i, self.notional_col])
+            K = float(out.loc[i, self.strike_col]) / 100.0
+            payer = payer_default
+            if self.payer_col and self.payer_col in out.columns:
+                payer = bool(out.loc[i, self.payer_col])
+
+            pv = float(pricer.swaption(Tau, N, K, payer=payer))
+            if forward_premium:
+                T0 = float(Tau[0])
+                df0 = float(pricer.curve.discount(T0))
+                model_prices.append(pv / (df0 + 1e-18))
+            else:
+                model_prices.append(pv)
+
+        out["Model_Price"] = model_prices
+        out["Rel_Error"] = out["Model_Price"] / (out[self.price_col].astype(float) + 1e-12) - 1.0
+        return out
+
+    def with_model_prices_2f(self, pricer2f: Any, forward_premium: bool = True, payer_default: bool = True) -> pd.DataFrame:
+        """
+        Compute model prices for ALL rows using HW2F pricer (Gaussian approx).
+
+        Uses:
+          pv = pricer2f.swaption_approx_hw2f(Tau, N, K, payer=?)
+        and optionally converts to forward premium dividing by DF(T0).
+        """
+        out = self.copy_df()
+        model_prices = []
+
+        for i in range(len(out)):
+            Tau = out.loc[i, self.dates_col]
+            N = float(out.loc[i, self.notional_col])
+            K = float(out.loc[i, self.strike_col]) / 100.0
+            payer = payer_default
+            if self.payer_col and self.payer_col in out.columns:
+                payer = bool(out.loc[i, self.payer_col])
+
+            pv = float(pricer2f.swaption_approx_hw2f(Tau, N, K, payer=payer))
+            if forward_premium:
+                T0 = float(Tau[0])
+                df0 = float(pricer2f.curve.discount(T0))
+                model_prices.append(pv / (df0 + 1e-18))
+            else:
+                model_prices.append(pv)
+
+        out["Model_Price"] = model_prices
+        out["Rel_Error"] = out["Model_Price"] / (out[self.price_col].astype(float) + 1e-12) - 1.0
+        return out
+
+
+@dataclass
+class CapletQuoteSet(QuoteSet):
+    """
+    Wrap caplet calibration template.
+
+    Required columns:
+      - price_col, strike_col, notional_col, expiry_col, maturity_col
+
+    Your calibrator expects:
+      Prices, Strike, Notional, Expiry, Maturity
+    """
+    price_col: str = "Price"
+    strike_col: str = "Strike"
+    notional_col: str = "Notional"
+    expiry_col: str = "Expiry"
+    maturity_col: str = "Maturity"
+
+    def to_market_dict(self) -> dict:
+        return {
+            "Prices": self.df[self.price_col].astype(float).tolist(),
+            "Strike": self.df[self.strike_col].astype(float).tolist(),
+            "Notional": self.df[self.notional_col].astype(float).tolist(),
+            "Expiry": self.df[self.expiry_col].astype(float).tolist(),
+            "Maturity": self.df[self.maturity_col].astype(float).tolist(),
+        }
+
+    def with_model_prices_1f(self, pricer: Any) -> pd.DataFrame:
+        """
+        Compute model PVs for caplets using HW1F pricer.caplet(T1,T2,N,K).
+        """
+        out = self.copy_df()
+        model_prices = []
+
+        for i in range(len(out)):
+            T1 = float(out.loc[i, self.expiry_col])
+            T2 = float(out.loc[i, self.maturity_col])
+            N = float(out.loc[i, self.notional_col])
+            K = float(out.loc[i, self.strike_col]) / 100.0
+            model_prices.append(float(pricer.caplet(T1, T2, N, K)))
+
+        out["Model Price"] = model_prices
+        out["Rel_Error"] = out["Model Price"] / (out[self.price_col].astype(float) + 1e-12) - 1.0
+        return out
+
+    def with_model_prices_2f(self, pricer2f: Any) -> pd.DataFrame:
+        """
+        Compute model PVs for caplets using HW2F pricer.caplet_hw2f(T1,T2,N,K).
+        """
+        out = self.copy_df()
+        model_prices = []
+
+        for i in range(len(out)):
+            T1 = float(out.loc[i, self.expiry_col])
+            T2 = float(out.loc[i, self.maturity_col])
+            N = float(out.loc[i, self.notional_col])
+            K = float(out.loc[i, self.strike_col]) / 100.0
+            model_prices.append(float(pricer2f.caplet_hw2f(T1, T2, N, K)))
+
+        out["Model Price"] = model_prices
+        out["Rel_Error"] = out["Model Price"] / (out[self.price_col].astype(float) + 1e-12) - 1.0
+        return out
+
+
+# -------------------------
+# util simple
+# -------------------------
+
+def worst_rows_by_abs_relerr(df: pd.DataFrame, relerr_col: str = "Rel_Error", n: int = 10) -> pd.DataFrame:
+    out = df.copy()
+    out["AbsRelErr"] = np.abs(out[relerr_col].astype(float))
+    return out.sort_values("AbsRelErr", ascending=False).head(int(n))
+
+
+### FILE: ir\instruments\rates.py
+# -*- coding: utf-8 -*-
+"""
+ir/instruments/rates.py
+
+Instruments IR: wrappers "POO" qui délèguent à tes pricers existants.
+Aucune formule n'est recodée ici.
+
+Tu peux t'en servir pour:
+- uniformiser le pricing (instrument.price(pricer))
+- construire des portfolios (list[Instrument]) plus tard
+
+Mais ton calibrage peut rester basé sur QuoteSets (base.py).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Sequence
+
+from ir.instruments.base import Instrument
+
+
+@dataclass(frozen=True)
+class Caplet(Instrument):
+    T1: float
+    T2: float
+    N: float
+    K: float  # rate units (0.03)
+
+    def price(self, pricer: Any) -> float:
+        # HW1F: pricer.caplet ; HW2F: pricer.caplet_hw2f
+        if hasattr(pricer, "caplet_hw2f"):
+            return float(pricer.caplet_hw2f(self.T1, self.T2, self.N, self.K))
+        return float(pricer.caplet(self.T1, self.T2, self.N, self.K))
+
+
+@dataclass(frozen=True)
+class Floorlet(Instrument):
+    # pas de méthode dédiée en 2F dans ton code, donc on appelle 1F floorlet via put/call ZC
+    # si tu ajoutes un floorlet_hw2f plus tard, cette classe le détectera.
+    T1: float
+    T2: float
+    N: float
+    K: float
+
+    def price(self, pricer: Any) -> float:
+        if hasattr(pricer, "floorlet_hw2f"):
+            return float(pricer.floorlet_hw2f(self.T1, self.T2, self.N, self.K))
+        # 1F: tu n'as pas de méthode floorlet explicite, donc on peut approx via floor([T1,T2],...)
+        # mais pour rester strict "pas d'ajout de formule", on utilise floor sur 2 dates:
+        Tau = [float(self.T1), float(self.T2)]
+        return float(pricer.floor(Tau, self.N, self.K))
+
+
+@dataclass(frozen=True)
+class Cap(Instrument):
+    Tau: Sequence[float]
+    N: float
+    K: float
+
+    def price(self, pricer: Any) -> float:
+        if hasattr(pricer, "cap_hw2f"):
+            return float(pricer.cap_hw2f(list(self.Tau), self.N, self.K))
+        return float(pricer.cap(list(self.Tau), self.N, self.K))
+
+
+@dataclass(frozen=True)
+class Floor(Instrument):
+    Tau: Sequence[float]
+    N: float
+    K: float
+
+    def price(self, pricer: Any) -> float:
+        if hasattr(pricer, "floor_hw2f"):
+            return float(pricer.floor_hw2f(list(self.Tau), self.N, self.K))
+        return float(pricer.floor(list(self.Tau), self.N, self.K))
+
+
+@dataclass(frozen=True)
+class Swap(Instrument):
+    Tau: Sequence[float]
+    N: float
+    K: float
+    payer: bool = True
+
+    def price(self, pricer: Any) -> float:
+        return float(pricer.swap(list(self.Tau), self.N, self.K, payer=self.payer))
+
+
+@dataclass(frozen=True)
+class Swaption(Instrument):
+    Tau: Sequence[float]
+    N: float
+    K: float
+    payer: bool = True
+    forward_premium: bool = True  # pour matcher ton notebook/calibration
+
+    def price(self, pricer: Any) -> float:
+        Tau = list(self.Tau)
+        if hasattr(pricer, "swaption_approx_hw2f"):
+            pv = float(pricer.swaption_approx_hw2f(Tau, self.N, self.K, payer=self.payer))
+            if self.forward_premium:
+                df0 = float(pricer.curve.discount(float(Tau[0])))
+                return pv / (df0 + 1e-18)
+            return pv
+
+        pv = float(pricer.swaption(Tau, self.N, self.K, payer=self.payer))
+        if self.forward_premium:
+            df0 = float(pricer.curve.discount(float(Tau[0])))
+            return pv / (df0 + 1e-18)
+        return pv
+
+
+### FILE: ir\market\curve.py
+from scipy.interpolate import interp1d
+from scipy.interpolate import UnivariateSpline
+import numpy as np
+
+
+class Curve:
+    """
+    Class to handle market curves, including discount factors and
+    instantaneous forward rates, with cubic interpolation and spline smoothing.
+    """
+
+    def __init__(self, time, discount_factors, smooth=1e-7):
+        """
+        Initializes a market curve object containing the discount curve
+        and the corresponding instantaneous forward curve.
+
+        Parameters
+        ----------
+        time : array_like
+            Time to maturity (in years) of the curve nodes.
+        discount_factors : array_like
+            Discount factors at the given maturities.
+        smooth : float, optional
+            Smoothing parameter for the forward spline interpolation (default: 1e-7).
+        """
+        self.time = np.array(time)
+        self.discount_factors = np.array(discount_factors)
+        self.smooth = smooth
+
+        self._build_interpolators()
+
+    def _build_interpolators(self):
+        """
+        Builds both the discount factor interpolation function and
+        the instantaneous forward rate spline in a single step.
+        """
+        # Cubic interpolation for discount factors
+        self.discount_func = interp1d(
+            self.time,
+            self.discount_factors,
+            kind='cubic',
+            fill_value="extrapolate",
+            bounds_error=False
+        )
+
+        # Spline for the log of discount factors (needed for forward rate derivation)
+        lnP = np.log(self.discount_factors)
+        self.forward_spline = UnivariateSpline(self.time, lnP, s=self.smooth)
+
+    def discount(self, t):
+        """
+        Returns the interpolated discount factor P(0, t).
+
+        Parameters
+        ----------
+        t : float or array_like
+            Time(s) to maturity.
+
+        Returns
+        -------
+        float or np.ndarray
+            Discount factor(s) corresponding to t.
+        """
+        return self.discount_func(t)
+
+    def inst_forward_rate(self, t):
+        """
+        Returns the interpolated instantaneous forward rate f(0, t).
+
+        Parameters
+        ----------
+        t : float or array_like
+            Time(s) to maturity.
+
+        Returns
+        -------
+        float or np.ndarray
+            Instantaneous forward rate(s) corresponding to t.
+        """
+        t = np.array(t)
+        return -self.forward_spline.derivative(1)(t)
+    
+
+    def forward_rate(self, T1, T2):
+        """
+        Computes the simple forward rate F(0; T1, T2) implied by the discount curve.
+
+        Parameters
+        ----------
+        T1 : float
+            Start time of the forward rate.
+        T2 : float
+            End time of the forward rate.
+
+        Returns
+        -------
+        float
+            Forward rate between T1 and T2.
+        """
+        
+        P1 = self.discount(T1)
+        P2 = self.discount(T2)
+
+        return (P1 / P2 - 1.0) / (T2 - T1)
+
+
+### FILE: ir\market\loaders_excel.py
+# -*- coding: utf-8 -*-
+"""
+ir/market/loaders_excel.py
+
+Loaders Excel -> objets "propres" (Curve + QuoteSets) pour notebooks.
+
+Objectifs:
+- Remplacer le glue-code notebook:
+    pd.read_excel(...), parse Payment_Dates, construire market_prices dict
+- Sans changer tes pricers/calibrators: on retourne exactement ce qu'ils attendent.
+
+Usage typique notebook:
+    curve = load_curve_xlsx(path)
+    swpn = load_swaption_template_xlsx(path)
+    market_dict = swpn.to_market_dict()
+"""
+
+from __future__ import annotations
+
+import ast
+from typing import Optional
+
+import pandas as pd
+
+# Imports robustes (migration progressive)
+try:
+    from ir.market.curve import Curve
+except Exception:  # pragma: no cover
+    from curve_builder import Curve  # type: ignore
+
+try:
+    from ir.instruments.base import SwaptionQuoteSet, CapletQuoteSet
+except Exception:  # pragma: no cover
+    from instruments.base import SwaptionQuoteSet, CapletQuoteSet  # type: ignore
+
+
+def _parse_list_cell(x) -> list[float]:
+    """
+    Parse une cellule Excel supposée contenir une liste:
+      - déjà list/tuple -> cast float
+      - string "[0.5, 1.0, ...]" -> ast.literal_eval
+    """
+    if isinstance(x, (list, tuple)):
+        return [float(v) for v in x]
+    if isinstance(x, str):
+        s = x.strip()
+        if not s:
+            return []
+        try:
+            obj = ast.literal_eval(s)  # safe eval (contrairement à eval)
+            if isinstance(obj, (list, tuple)):
+                return [float(v) for v in obj]
+        except Exception:
+            pass
+    # fallback
+    raise ValueError(f"Cannot parse payment dates cell: {x!r}")
+
+
+def load_curve_xlsx(
+    path: str,
+    sheet: str = "Curve",
+    time_col: str = "Year_Frac",
+    df_col: str = "Discount_Factor",
+    smooth: float = 1e-7,
+) -> Curve:
+    """
+    Read curve sheet and build Curve(time, discount_factors).
+
+    Parameters
+    ----------
+    path: xlsx path
+    sheet: sheet name containing curve nodes
+    time_col: column with year fractions
+    df_col: column with discount factors
+    smooth: passed to Curve (forward spline smoothing)
+    """
+    df = pd.read_excel(path, sheet_name=sheet)
+    time = df[time_col].astype(float).values
+    disc = df[df_col].astype(float).values
+    return Curve(time, disc, smooth=smooth)
+
+
+def load_swaption_template_xlsx(
+    path: str,
+    sheet: str = "Template",
+    payment_dates_col: str = "Payment_Dates",
+    price_col: str = "Price",
+    strike_col: str = "Strike",
+    notional_col: str = "Notional",
+    payer_col: Optional[str] = None,
+) -> SwaptionQuoteSet:
+    """
+    Read swaption calibration template (your SWPN_Calibration_Template_...xlsx).
+
+    Expected columns (minimum):
+      - Price, Strike, Notional, Payment_Dates
+    Optionally:
+      - Payer (bool) if provided in payer_col or column named "Payer"
+    """
+    df = pd.read_excel(path, sheet_name=sheet)
+
+    # Payment_Dates: string like "[0.5, 1.0, ...]" -> list[float]
+    if payment_dates_col in df.columns:
+        df[payment_dates_col] = [_parse_list_cell(v) for v in df[payment_dates_col].tolist()]
+    else:
+        raise KeyError(f"Missing column '{payment_dates_col}' in {sheet}.")
+
+    # Payer flags (optional)
+    if payer_col and payer_col in df.columns:
+        df["Payer"] = df[payer_col].astype(bool)
+    elif "Payer" in df.columns:
+        df["Payer"] = df["Payer"].astype(bool)
+
+    return SwaptionQuoteSet(
+        df=df,
+        price_col=price_col,
+        strike_col=strike_col,
+        notional_col=notional_col,
+        dates_col=payment_dates_col,
+        payer_col=("Payer" if "Payer" in df.columns else None),
+    )
+
+
+def load_caplet_template_xlsx(
+    path: str,
+    sheet: str = "Template",
+    drop_first_row_if_empty: bool = True,
+    price_col: str = "Price",
+    strike_col: str = "Strike",
+    notional_col: str = "Notional",
+    expiry_col: str = "Expiry",
+    maturity_col: str = "Maturity",
+) -> CapletQuoteSet:
+    """
+    Read caplet calibration template (your CAP_Calibration_Template_...xlsx).
+
+    Notes
+    -----
+    In your notebook you did: df = pd.read_excel(...).iloc[1:,:]
+    Sometimes first row is blank/header-like; we offer drop_first_row_if_empty.
+    """
+    df = pd.read_excel(path, sheet_name=sheet)
+
+    if drop_first_row_if_empty and len(df) >= 1:
+        # heuristic: if first row has NaNs for essential fields -> drop it
+        essentials = [price_col, strike_col, notional_col, expiry_col, maturity_col]
+        if any(col in df.columns for col in essentials):
+            row0 = df.iloc[0]
+            bad = True
+            for col in essentials:
+                if col in df.columns and pd.notna(row0[col]):
+                    bad = False
+                    break
+            if bad:
+                df = df.iloc[1:, :].reset_index(drop=True)
+
+    return CapletQuoteSet(
+        df=df.reset_index(drop=True),
+        price_col=price_col,
+        strike_col=strike_col,
+        notional_col=notional_col,
+        expiry_col=expiry_col,
+        maturity_col=maturity_col,
+    )
+
+
+def load_cap_market_data_xlsx(path: str) -> pd.DataFrame:
+    """
+    Read OTM caplet market data file (your CAP_Market_Data_...xlsx).
+    Returns DataFrame as-is (smile filtering remains notebook-side, by design).
+    """
+    return pd.read_excel(path)
+
+
+### FILE: ir\market\plots.py
+# -*- coding: utf-8 -*-
+"""
+ir/market/plots.py
+
+Fonctions de plotting réutilisables dans notebooks.
+But: garder le notebook lisible.
+
+- plot_curve(curve)
+- plot_prices_by_tenor(df, ...)
+- plot_vols_by_tenor(df, ...)
+- plot_smile_by_expiry(df, ...)  (caplets OTM)
+"""
+
+from __future__ import annotations
+
+from typing import Sequence, Optional
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+def plot_curve(curve, t_max: float = 30.0, n: int = 300, title_prefix: str = "Market") -> None:
+    t = np.linspace(0.01, float(t_max), int(n))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    axes[0].plot(t, curve.discount(t), linewidth=2)
+    axes[0].set_title(f"{title_prefix} Discount Curve", fontsize=14, fontweight="bold")
+    axes[0].set_xlabel("Time (Years)")
+    axes[0].set_ylabel("Discount Factor")
+    axes[0].grid(alpha=0.3)
+
+    axes[1].plot(t, curve.inst_forward_rate(t), linewidth=2)
+    axes[1].set_title(f"{title_prefix} Instantaneous Forward Rate", fontsize=14, fontweight="bold")
+    axes[1].set_xlabel("Time (Years)")
+    axes[1].set_ylabel("Rate")
+    axes[1].grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_prices_by_tenor(
+    df: pd.DataFrame,
+    tenors: Optional[Sequence[float]] = None,
+    tenor_col: str = "Tenor",
+    x_col: str = "Expiry",
+    mkt_col: str = "Price",
+    model_col: str = "Model_Price",
+    ylabel: str = "Forward Premium",
+    title: str = "Swaption Price Term Structure",
+) -> None:
+    if tenors is None:
+        tenors = [5.0, 10.0, 20.0, 30.0]
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    axes = axes.flatten()
+
+    for idx, tenor in enumerate(tenors):
+        ax = axes[idx]
+        dft = df[df[tenor_col] == tenor].copy()
+        if len(dft) == 0:
+            ax.set_axis_off()
+            continue
+        dft = dft.sort_values(x_col)
+
+        ax.plot(dft[x_col], dft[mkt_col], linewidth=2, label="Market")
+        ax.plot(dft[x_col], dft[model_col], linestyle="--", linewidth=2, label="Model")
+
+        ax.set_title(f"{title} (ATM, {int(tenor)}Y Tenor)", fontsize=13, fontweight="bold")
+        ax.set_xlabel("Expiry (Years)")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_vols_by_tenor(
+    df: pd.DataFrame,
+    tenors: Optional[Sequence[float]] = None,
+    tenor_col: str = "Tenor",
+    x_col: str = "Expiry",
+    mkt_col: str = "Volatility (Bps)",
+    model_col: str = "Model_Vol (Bps)",
+    ylabel: str = "Normal Vol (Bps)",
+    title: str = "Swaption Vol Term Structure",
+) -> None:
+    if tenors is None:
+        tenors = [5.0, 10.0, 20.0, 30.0]
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    axes = axes.flatten()
+
+    for idx, tenor in enumerate(tenors):
+        ax = axes[idx]
+        dft = df[df[tenor_col] == tenor].copy()
+        if len(dft) == 0:
+            ax.set_axis_off()
+            continue
+        dft = dft.sort_values(x_col)
+
+        ax.plot(dft[x_col], dft[mkt_col], linewidth=2, label="Market")
+        ax.plot(dft[x_col], dft[model_col], linestyle="--", linewidth=2, label="Model")
+
+        ax.set_title(f"{title} (ATM, {int(tenor)}Y Tenor)", fontsize=13, fontweight="bold")
+        ax.set_xlabel("Expiry (Years)")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_smile_by_expiry(
+    df: pd.DataFrame,
+    expiry_col: str = "Expiry",
+    x_col: str = "Moneyness",
+    mkt_col: str = "Volatility (Bps)",
+    model_col: str = "Model Vol",
+    n_panels: int = 4,
+    title_prefix: str = "Caplet Smile",
+) -> None:
+    """
+    df: DataFrame contenant au moins Expiry, Moneyness, Market vol, Model vol.
+    """
+    expiries = np.sort(df[expiry_col].dropna().unique())
+    if len(expiries) == 0:
+        raise ValueError("No expiries found for smile plot.")
+
+    # pick n_panels expiries spread out
+    n_panels = int(n_panels)
+    if len(expiries) >= n_panels:
+        exp_indices = np.linspace(0, len(expiries) - 1, n_panels, dtype=int)
+    else:
+        exp_indices = np.arange(len(expiries))
+
+    # grid layout: for 4 -> 2x2 ; else approximate square
+    if len(exp_indices) <= 4:
+        nrows, ncols = 2, 2
+    else:
+        ncols = int(np.ceil(np.sqrt(len(exp_indices))))
+        nrows = int(np.ceil(len(exp_indices) / ncols))
+
+    fig, axs = plt.subplots(nrows=nrows, ncols=ncols, figsize=(12, 8))
+    axs = np.array(axs).reshape(-1)
+
+    for k, idx in enumerate(exp_indices):
+        ax = axs[k]
+        expiry = expiries[idx]
+        mask = df[expiry_col] == expiry
+        dft = df[mask].sort_values(x_col)
+
+        ax.plot(dft[x_col], dft[mkt_col], linewidth=2, label="Market Smile")
+        ax.plot(dft[x_col], dft[model_col], linestyle="--", linewidth=2, label="Model Smile")
+
+        ax.set_title(f"{title_prefix} | Expiry: {expiry:.2f}Y", fontsize=12, fontweight="bold")
+        ax.set_xlabel("Moneyness (%)")
+        ax.set_ylabel("Implied Vol (Bps)")
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=9)
+
+    # hide remaining axes
+    for j in range(len(exp_indices), len(axs)):
+        axs[j].set_axis_off()
+
+    plt.tight_layout()
+    plt.show()
+
+
+### FILE: ir\models\hw1f.py
+import pandas as pd
+import numpy as np
+
+
+class HullWhiteModel:
+    """
+    Hull-White one-factor short rate model (no simulation).
+    
+    This class implements the analytical formulas for the 
+    extended Vasicek/Hull-White model:
+    
+        dr(t) = a * (θ(t) - r(t)) dt + σ dW(t)
+    
+    where:
+        a     = mean reversion speed
+        σ     = volatility of the short rate
+        θ(t)  = time-dependent drift fitted to the initial curve
+    
+    Attributes
+    ----------
+    curve : Curve
+        Instance representing the initial discount curve P(0, T).
+    parameters : dict
+        Dictionary containing model parameters:
+            - 'a' : float, mean reversion speed
+            - 'sigma' : float, volatility
+            - 'r0' : float, initial short rate
+    a : float
+        Mean reversion speed.
+    sigma : float
+        Volatility parameter.
+    r0 : float
+        Initial short rate.
+    """
+
+    def __init__(self, curve, parameters=None):
+        """
+        Initialize the Hull-White model with a given discount curve and parameters.
+
+        Parameters
+        ----------
+        curve : Curve
+            Discount curve used to fit θ(t) and compute forwards.
+        parameters : dict, optional
+            Dictionary with 'a', 'sigma', and 'r0'. If None, defaults are used: {'a': 0.01, 'sigma': 0.01, 'r0': curve.inst_forward_rate(0)}
+        """
+
+        self.curve = curve
+
+        # Default parameters
+        defaults = {'a': 0.01, 'sigma': 0.01, 'r0': curve.inst_forward_rate(0)}
+        if parameters is None: parameters = {}
+        self.parameters = {'a': parameters.get('a', defaults['a']),'sigma': parameters.get('sigma', defaults['sigma']),'r0': parameters.get('r0', defaults['r0'])}
+
+    def inst_forward_rate(self, t):
+        """
+        Compute the instantaneous forward rate f(0, t).
+
+        Parameters
+        ----------
+        t : float
+            Time in years.
+
+        Returns
+        -------
+        float
+            Instantaneous forward rate at time t.
+        """
+        return self.curve.inst_forward_rate(t)
+
+    def discount_factor(self, t):
+        """
+        Compute the discount factor P(0, t).
+
+        Parameters
+        ----------
+        t : float
+            Time in years.
+
+        Returns
+        -------
+        float
+            Discount factor for maturity t.
+        """
+        return self.curve.discount(t)
+    
+    def forward_rate(self, T1, T2):
+        """
+        Compute the simple forward rate F(0; T1, T2) implied by the discount curve. 
+        Parameters
+        ----------      
+        T1 : float
+            Start time of the forward rate.
+        T2 : float
+            End time of the forward rate.
+        Returns 
+        -------
+        float
+            Forward rate between T1 and T2.
+        """
+        return self.curve.forward_rate(T1, T2)
+
+    def alpha(self, t):
+        """
+        Compute α(t), the deterministic shift function in Hull–White.
+
+        Formula:
+            α(t) = f(0, t) + (σ² / (2a²)) * (1 - e^{-a t})²
+
+        Parameters
+        ----------
+        t : float
+            Time in years.
+
+        Returns
+        -------
+        float
+            α(t) value.
+        """
+        a = self.parameters['a']
+        sigma = self.parameters['sigma']
+        fwd = self.inst_forward_rate(t)
+        return fwd + (sigma**2) / (2 * a**2) * (1 - np.exp(-a * t))**2
+
+    def B(self, t, T):
+        """
+        Compute B(t, T) function used in bond pricing.
+
+        Formula:
+            B(t, T) = (1 - e^{-a (T - t)}) / a
+
+        Parameters
+        ----------
+        t : float
+            Start time in years.
+        T : float
+            Maturity time in years.
+
+        Returns
+        -------
+        float
+            B(t, T) value.
+        """
+        a = self.parameters['a']
+        return (1 - np.exp(-a * (T - t))) / a
+
+    def A(self, t, T):
+        """
+        Compute A(t, T) function used in zero-coupon bond pricing.
+
+        Formula:
+            A(t, T) = [P(0, T) / P(0, t)] * exp(B(t, T) * f(0, t) - 
+                       (σ² / (4a)) * (1 - e^{-2a t}) * B(t, T)²)
+
+        Parameters
+        ----------
+        t : float
+            Start time in years.
+        T : float
+            Maturity time in years.
+
+        Returns
+        -------
+        float
+            A(t, T) value.
+        """
+        a = self.parameters['a']
+        sigma = self.parameters['sigma']
+        P_t = self.discount_factor(t)
+        P_T = self.discount_factor(T)
+        fwd = self.inst_forward_rate(t)
+        B = self.B(t, T)
+        return (P_T / P_t) * np.exp(
+            B * fwd - (sigma**2 / (4 * a)) * (1 - np.exp(-2 * a * t)) * B**2
+        )
+
+    def short_rate(self, t, z=None):
+        """
+        Compute the short rate r(t) under the risk-neutral measure 
+        using the exact distribution.
+
+        Distribution:
+            r(t) ~ Normal(mean = E[r(t)], variance = V[r(t)])
+
+        Parameters
+        ----------
+        t : float
+            Time in years.
+        z : float, optional
+            Standard normal draw. If None, one is generated.
+
+        Returns
+        -------
+        float
+            Simulated short rate at time t.
+        """
+        if z is None:
+            z = np.random.normal()
+
+        r0 = self.parameters['r0']
+        a = self.parameters['a']
+        sigma = self.parameters['sigma']
+        V = (sigma**2 / (2 * a)) * (1 - np.exp(-2 * a * t))
+        E = r0 * np.exp(-a * t) + self.alpha(t) - np.exp(-a * t) * self.alpha(0)
+        return E + np.sqrt(V) * z
+
+
+class HullWhiteSimulation:
+    """
+    Monte Carlo simulation engine for the Hull–White one-factor model.
+
+    Provides:
+        - Exact simulation of r(T) at a single maturity (no path generation)
+        - Euler–Maruyama path simulation under the risk-neutral measure
+        - Analytical validation of simulated mean and variance
+
+    Attributes
+    ----------
+    model : HullWhiteModel
+        Hull–White model instance providing parameters and curve.
+    n_paths : int
+        Number of Monte Carlo paths.
+    n_steps : int
+        Number of time steps for Euler path simulation.
+    seed : int
+        Random seed for reproducibility.
+    """
+
+    def __init__(self, model: HullWhiteModel, n_paths=10**5, n_steps=100, seed=2025):
+        """
+        Initialize the Hull–White simulation engine.
+
+        Parameters
+        ----------
+        model : HullWhiteModel
+            Hull–White model instance.
+        n_paths : int, optional
+            Number of Monte Carlo paths (default: 100,000).
+        n_steps : int, optional
+            Number of steps for Euler path simulation (default: 100).
+        seed : int, optional
+            Random seed for reproducibility (default: 2025).
+        """
+        self.model = model
+        self.n_paths = n_paths
+        self.n_steps = n_steps
+        self.seed = np.random.seed(seed)
+
+    def simulate_short_rate_direct(self, T):
+        """
+        Simulate r(T) using the exact analytical distribution 
+        under the risk-neutral measure.
+
+        Parameters
+        ----------
+        T : float
+            Simulation horizon in years.
+
+        Returns
+        -------
+        ndarray
+            Array of simulated short rates (n_paths,).
+        """
+        z = np.random.normal(size=self.n_paths)
+        r = np.array([self.model.short_rate(T, z=z_i) for z_i in z])
+        return r
+
+
+class HullWhiteCurveBuilder:
+    """
+    Hull–White curve builder that provides both analytical formulas and Monte Carlo 
+    simulation utilities for pricing zero-coupon bonds, discount factors, 
+    forward rates, and long-term rates, using a pre-built discount curve.
+
+    Attributes
+    ----------
+    model : HullWhiteModel
+        Hull–White model instance constructed from the provided curve and parameters.
+    sim : HullWhiteSimulation
+        Monte Carlo simulation engine built from the Hull–White model.
+    curve : Curve
+        Pre-initialized discount curve used for forwards and short rate calculations.
+    """
+
+    def __init__(self, curve, params=None, n_paths=10**5, n_steps=100, seed=2025, smooth=1e-7):
+        """
+        Initialize the Hull–White curve builder using a pre-built Curve instance and 
+        Hull–White model parameters.
+
+        Parameters
+        ----------
+        Curve : Curve
+            Pre-initialized discount curve instance containing times to maturity 
+            and discount factors.
+        params : dict, optional
+            Dictionary containing Hull–White model parameters (optional):
+                - 'a' : float, mean reversion speed
+                - 'sigma' : float, volatility
+                - 'r0' : float, initial short rate
+            If None, defaults are used: {'a': 0.01, 'sigma': 0.01, 'r0': curve.inst_forward_rate(0)}
+        n_paths : int, optional
+            Number of Monte Carlo paths (default: 100,000).
+        n_steps : int, optional
+            Number of discretization steps per path (default: 100).
+        seed : int, optional
+            Random seed for reproducibility (default: 2025).
+        smooth : float, optional
+            Smoothing parameter for the discount curve (not used if Curve is already initialized).
+
+        Workflow
+        --------
+        1. Use the provided Curve instance for discount factors and instantaneous forwards.
+        2. Build the Hull–White model using the curve and provided parameters.
+        3. Initialize the Monte Carlo simulation engine for short rate paths.
+        """
+        self.curve = curve
+        self.model = HullWhiteModel(self.curve, params)
+        self.sim = HullWhiteSimulation(self.model, n_paths=n_paths, n_steps=n_steps, seed=seed)
+
+
+    def short_rate(self, t):
+        """
+        Simulate the short rate r(t) at a single time t using the exact distribution.
+
+        Parameters
+        ----------
+        t : float
+            Time in years.
+
+        Returns
+        -------
+        ndarray
+            Array of simulated short rates (n_paths,).
+        """
+        return self.sim.simulate_short_rate_direct(t)
+
+
+    def zero_coupon_bond(self, t, T):
+        """
+        Price a zero-coupon bond analytically under the risk-neutral 
+
+        Formula:
+            P(t, T) = A(t, T) * exp(-B(t, T) * r(t))
+
+        Parameters
+        ----------
+        t : float
+            Current time in years.
+        T : float
+            Bond maturity in years.
+
+        Returns
+        -------
+        ndarray
+            Bond price distribution.
+        """
+        r_t = self.sim.simulate_short_rate_direct(t)
+
+        A = self.model.A(t, T)
+        B = self.model.B(t, T)
+        price = A * np.exp(-B * r_t)
+        return price
+
+
+
+### FILE: ir\models\hw2f.py
+import pandas as pd
+import numpy as np
+
+
+class HullWhite2FModel:
+    """
+    Hull-White two-factor (G2++) Gaussian short-rate model - analytical building blocks.
+
+    We use the standard G2++ factor dynamics under the risk-neutral measure:
+        dx(t) = -a x(t) dt + sigma dW1(t)
+        dy(t) = -b y(t) dt + eta   dW2(t)
+        dW1 dW2 = rho dt
+
+    This class focuses on *closed-form* ingredients needed for:
+      - Caplet pricing via bond-option representation (needs v^2(T,S))
+      - Swaption pricing via Gaussian swap-rate approximation (needs I_aa, I_bb, I_ab)
+
+    Notes
+    -----
+    - The curve is assumed to provide P(0,t) and f(0,t) via the same interface as in 1F.
+    - Time is in years.
+    - Parameters are constants (no piecewise term structures).
+    """
+
+    def __init__(self, curve, parameters=None):
+        self.curve = curve
+
+        # Defaults (reasonable generic starting points)
+        defaults = {
+            "a": 0.10,
+            "b": 0.02,
+            "rho": -0.30,
+            "sigma": 0.01,
+            "eta": 0.008,
+            "r0": curve.inst_forward_rate(0),
+        }
+        if parameters is None:
+            parameters = {}
+
+        self.parameters = {
+            "a": float(parameters.get("a", defaults["a"])),
+            "b": float(parameters.get("b", defaults["b"])),
+            "rho": float(parameters.get("rho", defaults["rho"])),
+            "sigma": float(parameters.get("sigma", defaults["sigma"])),
+            "eta": float(parameters.get("eta", defaults["eta"])),
+            "r0": float(parameters.get("r0", defaults["r0"])),
+        }
+
+    # --- curve interface (same spirit as HullWhiteModel 1F) --- #
+
+    def inst_forward_rate(self, t: float) -> float:
+        return self.curve.inst_forward_rate(t)
+
+    def discount_factor(self, t: float) -> float:
+        return self.curve.discount(t)
+
+    def forward_rate(self, T1: float, T2: float) -> float:
+        return self.curve.forward_rate(T1, T2)
+
+    # --- HW2F deterministic loadings --- #
+
+    def B_a(self, t: float, T: float) -> float:
+        """ B_a(t,T) = (1 - exp(-a*(T-t)))/a """
+        a = self.parameters["a"]
+        return (1.0 - np.exp(-a * (T - t))) / a
+
+    def B_b(self, t: float, T: float) -> float:
+        """ B_b(t,T) = (1 - exp(-b*(T-t)))/b """
+        b = self.parameters["b"]
+        return (1.0 - np.exp(-b * (T - t))) / b
+
+    # ------------------------------------------------------------------
+    # Caplet ingredient: v^2(T,S) for bond option (and thus caplet)
+    # ------------------------------------------------------------------
+
+    def v2_caplet(self, T: float, S: float) -> float:
+        """
+        Closed-form variance v^2(T,S) entering the ZC bond option (and caplet) formula.
+
+        With tau = S - T, and constant parameters:
+            v^2(T,S) =
+              (sigma^2/(2a^3)) (1 - e^{-2aT}) (1 - e^{-a tau})^2
+            + (eta^2  /(2b^3)) (1 - e^{-2bT}) (1 - e^{-b tau})^2
+            + (2 rho sigma eta /(a b (a+b))) (1 - e^{-(a+b)T})
+                (1 - e^{-a tau})(1 - e^{-b tau})
+
+        Parameters
+        ----------
+        T : float
+            Option expiry / fixing time.
+        S : float
+            Bond maturity / payment time (S > T).
+
+        Returns
+        -------
+        float
+            Variance v^2(T,S) (dimensionless).
+        """
+        if S <= T:
+            raise ValueError("v2_caplet requires S > T.")
+
+        a = self.parameters["a"]
+        b = self.parameters["b"]
+        rho = self.parameters["rho"]
+        sigma = self.parameters["sigma"]
+        eta = self.parameters["eta"]
+
+        tau = S - T
+
+        # convenient exponentials
+        eaT = np.exp(-2.0 * a * T)
+        ebT = np.exp(-2.0 * b * T)
+        eabT = np.exp(-(a + b) * T)
+
+        ea_tau = np.exp(-a * tau)
+        eb_tau = np.exp(-b * tau)
+
+        term_a = (sigma * sigma) / (2.0 * a**3) * (1.0 - eaT) * (1.0 - ea_tau) ** 2
+        term_b = (eta * eta) / (2.0 * b**3) * (1.0 - ebT) * (1.0 - eb_tau) ** 2
+        term_ab = (
+            2.0
+            * rho
+            * sigma
+            * eta
+            / (a * b * (a + b))
+            * (1.0 - eabT)
+            * (1.0 - ea_tau)
+            * (1.0 - eb_tau)
+        )
+
+        return float(term_a + term_b + term_ab)
+
+    # ------------------------------------------------------------------
+    # Swaption approx ingredient: closed-form integrals I_aa, I_bb, I_ab
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def I_aa(T: float, U: float, V: float, a: float) -> float:
+        """
+        I_aa(T;U,V) = ∫_0^T B_a(t,U) B_a(t,V) dt, with B_a(t,U)=(1-e^{-a(U-t)})/a.
+
+        Closed form (standard case U,V >= T):
+            T/a^2
+          - (e^{-aU}+e^{-aV})(e^{aT}-1)/a^3
+          + e^{-a(U+V)}(e^{2aT}-1)/(2a^3)
+        """
+        if a <= 0:
+            raise ValueError("a must be > 0 in I_aa.")
+        return float(
+            (T / a**2)
+            - ((np.exp(-a * U) + np.exp(-a * V)) * (np.exp(a * T) - 1.0) / a**3)
+            + (np.exp(-a * (U + V)) * (np.exp(2.0 * a * T) - 1.0) / (2.0 * a**3))
+        )
+
+    @staticmethod
+    def I_bb(T: float, U: float, V: float, b: float) -> float:
+        """Same as I_aa, replacing a by b."""
+        if b <= 0:
+            raise ValueError("b must be > 0 in I_bb.")
+        return float(
+            (T / b**2)
+            - ((np.exp(-b * U) + np.exp(-b * V)) * (np.exp(b * T) - 1.0) / b**3)
+            + (np.exp(-b * (U + V)) * (np.exp(2.0 * b * T) - 1.0) / (2.0 * b**3))
+        )
+
+    @staticmethod
+    def I_ab(T: float, U: float, V: float, a: float, b: float) -> float:
+        """
+        I_ab(T;U,V) = ∫_0^T B_a(t,U) B_b(t,V) dt
+
+        Closed form (standard case U,V >= T):
+            T/(ab)
+          - e^{-aU}(e^{aT}-1)/(a^2 b)
+          - e^{-bV}(e^{bT}-1)/(a b^2)
+          + e^{-(aU+bV)}(e^{(a+b)T}-1)/(ab(a+b))
+        """
+        if a <= 0 or b <= 0:
+            raise ValueError("a,b must be > 0 in I_ab.")
+        return float(
+            (T / (a * b))
+            - (np.exp(-a * U) * (np.exp(a * T) - 1.0) / (a**2 * b))
+            - (np.exp(-b * V) * (np.exp(b * T) - 1.0) / (a * b**2))
+            + (np.exp(-(a * U + b * V)) * (np.exp((a + b) * T) - 1.0) / (a * b * (a + b)))
+        )
+
+   
+   
+
+
+
+### FILE: ir\models\__init__.py
+
+
+### FILE: ir\pricers\hw1f_pricer.py
+import numpy as np
+from scipy.stats import norm
+from scipy.optimize import brentq
+from ir.models.hw1f import HullWhiteCurveBuilder
+from ir.models.hw2f import HullWhite2FModel
+
+
+class HullWhitePricer:
+    """
+    Pricing engine for interest rate derivatives under the Hull–White one-factor model,
+    using a single HullWhiteCurveBuilder instance.
+
+    Supports:
+        - Zero-coupon bond options (calls & puts)
+        - Caps and floors
+        - Swaps and swaptions
+        - Monte Carlo or closed-form valuation
+
+    Attributes
+    ----------
+    curve_builder : HullWhiteCurveBuilder
+        Hull–White curve builder providing the model, simulation engine, and discount curve.
+    """
+
+    def __init__(self, curve, n_paths=10**5, n_steps=252, seed=2025, hw_params=None):
+        self.curve = curve
+        self.curve_sim = HullWhiteCurveBuilder(curve, params = hw_params, n_paths = n_paths, n_steps = n_steps, seed = seed)
+        self.model = self.curve_sim.model
+
+
+    def set_simulation(self, n_paths=None, n_steps=None, seed=None):
+        """
+        Update Monte Carlo simulation settings in-place after initialization.
+
+        Parameters
+        ----------
+        n_paths : int, optional
+            New number of Monte Carlo paths.
+        n_steps : int, optional
+            New number of Euler discretization steps.
+        seed : int, optional
+            Random seed to reseed NumPy's RNG.
+        """
+        if n_paths is not None: self.curve_sim.sim.n_paths = int(n_paths)
+        if n_steps is not None: self.curve_sim.sim.n_steps = int(n_steps)
+        if seed is not None: np.random.seed(seed)
+
+
+    def zero_bond_put(self, T, S, K, mc=False):
+        """
+        Value a European put option on a zero-coupon bond P(T, S).
+
+        Parameters
+        ----------
+        T : float
+            Option maturity in years.
+        S : float
+            Bond maturity in years (must be S > T).
+        K : float
+            Strike price.
+
+        Returns
+        -------
+        float
+            Present value of the put option.
+        """
+        if T == 0:
+            P_0S = self.model.discount_factor(S)
+            return max(K - P_0S, 0)
+
+
+        sigma = self.model.parameters['sigma']
+        a = self.model.parameters['a']
+        B = self.model.B(T, S)
+        P_S = self.model.discount_factor(S)
+        P_T = self.model.discount_factor(T)
+        sigma_p = sigma * np.sqrt((1 - np.exp(-2 * a * T)) / (2 * a)) * B
+        h = (1 / sigma_p) * np.log(P_S / (K * P_T)) + 0.5 * sigma_p
+        V0 = K * P_T * norm.cdf(-h + sigma_p) - P_S * norm.cdf(-h)
+
+        return V0
+
+    def zero_bond_call(self, T, S, K):
+        """
+        Value a European call option on a zero-coupon bond P(T, S).
+
+        Parameters
+        ----------
+        T : float
+            Option maturity in years.
+        S : float
+            Bond maturity in years (must be S > T).
+        K : float
+            Strike price.
+        Returns
+        -------
+        float
+            Present value of the call option.
+        """
+        sigma = self.model.parameters['sigma']
+        a = self.model.parameters['a']
+        B = self.model.B(T, S)
+        P_S = self.model.discount_factor(S)
+        P_T = self.model.discount_factor(T)
+        sigma_p = sigma * np.sqrt((1 - np.exp(-2 * a * T)) / (2 * a)) * B
+        h = (1 / sigma_p) * np.log(P_S / (K * P_T)) + 0.5 * sigma_p
+        V0 = P_S * norm.cdf(h) - K * P_T * norm.cdf(h - sigma_p)
+
+        return V0
+    
+    
+    def caplet(self, T1, T2, N, K, method='js'):
+        """
+        Value an interest rate caplet.
+
+        Parameters
+        ----------
+        T1 : float
+            Fixing time.
+        T2 : float
+            Payment time (must be T2 > T1).
+        N : float
+            Notional amount.
+        K : float
+            Caplet strike rate.
+
+        Returns
+        -------
+        float
+            Present value of the caplet.
+        """
+        Delta = T2 - T1
+        K_bond = 1 + K * Delta
+
+        if method == 'js':
+            put_price = self.zero_bond_put(T1, T2, 1 / K_bond)
+            Caplet = K_bond * put_price
+
+        elif method == 'cf':
+            sigma = self.model.parameters['sigma']
+            a = self.model.parameters['a']
+            B = self.model.B(T1, T2)
+            P_T2 = self.model.discount_factor(T2)
+            P_T1 = self.model.discount_factor(T1)
+            sigma_p = sigma * np.sqrt((1 - np.exp(-2 * a * T1)) / (2 * a)) * B
+            h = (1 / sigma_p) * np.log(P_T2 * K_bond / P_T1) + 0.5 * sigma_p
+            Caplet = (P_T1 * norm.cdf(-h + sigma_p) - K_bond * P_T2 * norm.cdf(-h))
+
+        return N * Caplet
+    
+
+    def cap(self, Tau, N, K):
+        """
+        Value an interest rate cap using caplets.
+
+        Parameters
+        ----------
+        Tau : list of float
+            Payment times for caplets (first entry is fixing time, not payment).
+        N : float
+            Notional amount.
+        K : float
+            Cap strike rate.
+
+        Returns
+        -------
+        float
+            Present value of the cap.
+        """
+        Cap = 0
+        for i in range(1, len(Tau)):
+                t_prev = Tau[i - 1]
+                t_curr = Tau[i]
+                Delta = t_curr - t_prev
+                K_bond = 1 + K * Delta
+                put_price = self.zero_bond_put(t_prev, t_curr, 1 / K_bond)
+                Cap += K_bond * put_price
+
+        return N * Cap
+
+    def floor(self, Tau, N, K, mc=False):
+        """
+        Value an interest rate floor using floorlets.
+
+        Parameters
+        ----------
+        Tau : list of float
+            Payment times for floorlets (first entry is fixing time, not payment).
+        N : float
+            Notional amount.
+        K : float
+            Floor strike rate.
+        Returns
+        -------
+        float
+            Present value of the floor.
+        """
+        Floor = 0
+        for i in range(1, len(Tau)):
+                t_prev = Tau[i - 1]
+                t_curr = Tau[i]
+                Delta = t_curr - t_prev
+                K_bond = 1 + K * Delta
+                call_price = self.zero_bond_call(t_prev, t_curr, 1 / K_bond)
+                Floor += K_bond * call_price
+
+        return N * Floor
+    
+    
+    def swap(self, Tau, N, K, payer = True, mc=False):
+        """
+        Value a plain vanilla interest rate swap.
+
+        Parameters
+        ----------
+        Tau : list of float
+            Payment times for the fixed leg (first entry is start time).
+        N : float
+            Notional amount.
+        K : float
+            Fixed rate.
+        payer : bool
+            If True, value a payer swap; otherwise a receiver swap.
+
+        Returns
+        -------
+        float
+            Present value of the swap.
+        """
+
+        w = 1 if payer else -1
+        Annuity = 0
+        for i in range(1, len(Tau)):
+            Delta = Tau[i] - Tau[i-1]
+            P_T = self.model.discount_factor(Tau[i])
+            Annuity += Delta * P_T
+
+        Fixed_leg = Annuity * K
+        Floating_leg = 0
+
+        Floating_leg = self.model.discount_factor(Tau[0]) - self.model.discount_factor(Tau[-1])
+
+        Swap = N * w * (Floating_leg - Fixed_leg) 
+        return Swap
+    
+
+    def swaption(self, Tau, N, K, payer = True, mc=False):
+        """
+        Value a European payer swaption.
+
+        Parameters
+        ----------
+        Tau : list of float
+            Payment times for the fixed leg (first entry is start time).
+        N : float
+            Notional amount.
+        K : float
+            Fixed rate.
+        payer : bool
+            If True, value a payer swaption; otherwise a receiver swaption.
+
+        Returns
+        -------
+        float
+            Present value of the swaption.
+        """
+
+        w = 1 if payer else -1
+        T = Tau[0]  # Expiry
+        S = Tau[-1] # Maturity
+
+        r_star = self._find_rstar(T, Tau, K)
+        fixed_leg = 0
+        for i in range(1, len(Tau)):
+            T1 = Tau[i - 1]
+            T2 = Tau[i]
+            Delta = T2 - T1
+            B = self.model.B(T, T2)
+            A = self.model.A(T, T2)
+            K_i = A * np.exp(-B * r_star)
+            option = self.zero_bond_put(T, T2, K_i) if payer else self.zero_bond_call(T, T2, K_i)   
+            fixed_leg += Delta * K * option
+        
+        # Floating leg: option on zero-coupon bond maturing at S
+        B_N = self.model.B(T, S)
+        A_N = self.model.A(T, S)
+        K_N = A_N * np.exp(-B_N * r_star)
+        floating_leg = self.zero_bond_put(T, S, K_N) if payer else self.zero_bond_call(T, S, K_N)
+        
+        swaption = N * (floating_leg + fixed_leg)
+
+        return swaption
+    
+
+    def coupon_bond(self, Tau, C, N):
+        """
+        Value a coupon bond.
+
+        Parameters
+        ----------
+        Tau : list of float
+            Payment dates of the bond (T1, T2, ..., TN).
+        C : float
+            Coupon rate (annualized).
+        N : float
+            Notional (scaling factor).
+
+        Returns
+        -------
+        float
+            PV of the coupon bond.
+        """
+
+        bond_price = 0
+        Delta = (Tau[-1] - Tau[0])
+
+        for i in range(len(Tau)):
+            P_T = self.curve.discount(Tau[i])
+            cashflow = N * (1 + C * Delta) if i == len(Tau) - 1 else N * C * Delta
+            bond_price += cashflow * P_T
+
+        return bond_price
+    
+
+    def floating_rate_note(self, Tau, N):
+        """
+        Value a floating rate note (FRN).
+
+        Parameters
+        ----------
+        Tau : list of float
+            Payment dates of the bond (T1, T2, ..., TN).
+
+        N : float
+            Notional (scaling factor).
+
+        Returns
+        -------
+        float
+            PV of the floating rate note.
+        """
+
+        disc_cf = self.swap(Tau, N, K=0, payer=False, mc=False)
+        disc_notional = N * self.model.discount_factor(Tau[-1])
+        frn_price = disc_cf + disc_notional
+
+        return frn_price
+
+
+    def bond_option(self, T, Tau, C, K, N, call=True, mc=False):
+        """
+        European option on a coupon bond using simulation or analytical Jamshidian decomposition.
+
+        Parameters
+        ----------
+        T : float
+            Option expiry.
+        Tau : list of float
+            Payment dates of the bond (T1, T2, ..., TN).
+        C : float
+            Coupon rate (annualized). 
+        K : float
+            Strike price of the option (absolute price, not percentage).
+        N : float
+            Notional (scaling factor).
+        call : bool
+            True for a call, False for a put.
+
+        Returns
+        -------
+        float
+            PV of the European option on the coupon bond.
+        """
+
+        # Find critical short rate r* using Jamshidian decomposition for bond options
+        r_star = self._find_rstar_bond(T, Tau, C, N, K)
+        bond_option = 0
+        Delta = (Tau[-1] - Tau[0]) 
+
+        # Decompose into portfolio of zero-coupon bond options
+        for i in range(len(Tau)):
+            B = self.model.B(T, Tau[i])
+            A = self.model.A(T, Tau[i])
+            K_i = A * np.exp(-B * r_star)  # Strike for each zero-coupon bond
+            
+            # Value option on each zero-coupon bond
+            option = self.zero_bond_call(T, Tau[i], K_i) if call else self.zero_bond_put(T, Tau[i], K_i)
+            
+            # Apply correct cashflow: C is annualized rate, multiply by Delta
+            cashflow = N * (1 + C * Delta) if i == len(Tau) - 1 else N * C * Delta
+            bond_option += cashflow * option
+
+        return bond_option
+
+
+    # --- Helper methods for Jamshidian decomposition --- #
+
+    def _jamshidian_root(self, T, Tau, K, r_star):
+        """
+        Jamshidian root-finding function for swaption pricing.
+
+        Parameters
+        ----------
+        T : float
+            Option expiry time.
+        Tau : list of float
+            Payment times for the swap.
+        K : float
+            Fixed rate.
+        r_star : float
+            Short rate candidate.
+
+        Returns
+        -------
+        float
+            Root equation value.
+        """
+        root = 0
+        for i in range(1, len(Tau)):
+            T1 = Tau[i - 1]
+            T2 = Tau[i]
+            Delta = T2 - T1
+            B = self.model.B(T, T2)
+            A = self.model.A(T, T2)
+            P_i = A * np.exp(-B * r_star)
+            root += Delta * K * P_i
+
+        root = root - (1 - P_i)
+        return root
+
+
+    def _find_rstar(self, T, Tau, K, x_min=-3, x_max=3):
+        """
+        Find critical short rate r* using Brent's method.
+
+        Parameters
+        ----------
+        T : float
+            Option expiry time.
+        Tau : list of float
+            Payment times for the swap.
+        K : float
+            Fixed rate.
+        x_min : float, optional
+            Lower bound for root search.
+        x_max : float, optional
+            Upper bound for root search.
+
+        Returns
+        -------
+        float
+            Critical short rate r*.
+        """
+        f = lambda r: self._jamshidian_root(T, Tau, K, r)
+        r_star = brentq(f, x_min, x_max, xtol=1e-12)
+        return r_star
+
+
+    def _jamshidian_root_bond(self, T, Tau, C, N, K_strike, r_star):
+        """
+        Jamshidian root-finding function for bond option pricing.
+        Solves: sum(cashflow_i * P(T, T_i; r*)) = K_strike
+
+        Parameters
+        ----------
+        T : float
+            Option expiry time.
+        Tau : list of float
+            Coupon payment dates.
+        C : float
+            Coupon rate (annualized).
+        N : float
+            Notional amount.
+        K_strike : float
+            Strike price of the bond option.
+        r_star : float
+            Short rate candidate.
+
+        Returns
+        -------
+        float
+            Root equation value (bond price - strike).
+        """
+        bond_price = 0
+        Delta = (Tau[-1] - Tau[0])
+        
+        for i in range(len(Tau)):
+            B = self.model.B(T, Tau[i])
+            A = self.model.A(T, Tau[i])
+            P_i = A * np.exp(-B * r_star)
+            cashflow = N * (1 + C * Delta) if i == len(Tau) - 1 else N * C * Delta
+            bond_price += cashflow * P_i
+        
+        return bond_price - K_strike
+
+
+    def _find_rstar_bond(self, T, Tau, C, N, K_strike, x_min=-3, x_max=3):
+        """
+        Find critical short rate r* for bond option using Brent's method.
+
+        Parameters
+        ----------
+        T : float
+            Option expiry time.
+        Tau : list of float
+            Coupon payment dates.
+        C : float
+            Coupon rate (annualized).
+        N : float
+            Notional amount.
+        K_strike : float
+            Strike price of the bond option.
+        x_min : float, optional
+            Lower bound for root search.
+        x_max : float, optional
+            Upper bound for root search.
+
+        Returns
+        -------
+        float
+            Critical short rate r*.
+        """
+        f = lambda r: self._jamshidian_root_bond(T, Tau, C, N, K_strike, r)
+        r_star = brentq(f, x_min, x_max, xtol=1e-12)
+        return r_star
+
+
+### FILE: ir\pricers\hw2f_pricer.py
+import numpy as np
+from scipy.stats import norm
+from scipy.optimize import brentq
+from ir.models.hw2f import HullWhite2FModel
+
+
+class HullWhite2FPricer:
+    """
+    Pricing engine for caplets and swaptions under Hull-White 2F (G2++):
+
+    - Caplet pricing: via ZC bond put using closed-form bond option variance v^2(T,S)
+    - Swaption pricing: via Gaussian swap-rate approximation and Bachelier pricing
+
+    Notes
+    -----
+    - Single-curve setup: discounting and forwarding from the same curve.
+    - Accruals are approximated as Delta = Tau[i] - Tau[i-1] (same convention as your 1F pricer).
+    """
+
+    def __init__(self, curve, hw2f_params=None):
+        self.curve = curve
+        self.model = HullWhite2FModel(curve, hw2f_params)
+
+    # -------------------------
+    # Helpers (curve quantities)
+    # -------------------------
+
+    def discount_factor(self, t: float) -> float:
+        return self.model.discount_factor(t)
+
+    def _annuity_and_swap_rate_0(self, Tau):
+        """
+        Compute A0 and S0 for a fixed-leg schedule Tau = [T0, T1, ..., Tn].
+
+        A0 = sum_i Delta_i P(0,Ti)
+        S0 = (P(0,T0) - P(0,Tn)) / A0
+        """
+        if len(Tau) < 2:
+            raise ValueError("Tau must contain at least [T0, Tn].")
+
+        T0 = float(Tau[0])
+        Tn = float(Tau[-1])
+
+        A0 = 0.0
+        for i in range(1, len(Tau)):
+            Ti = float(Tau[i])
+            delta = float(Tau[i] - Tau[i - 1])
+            A0 += delta * self.discount_factor(Ti)
+
+        if A0 <= 0:
+            raise ValueError("Annuity A0 must be > 0.")
+
+        S0 = (self.discount_factor(T0) - self.discount_factor(Tn)) / A0
+        return float(A0), float(S0)
+
+    def _swaption_weights_frozen(self, Tau):
+        """
+        Build frozen weights c_j for dates U_j = Tau[j] in the Gaussian swap-rate approx.
+
+        We approximate:
+          dS(t) ≈ sum_j c_j * (dP(t, U_j) / P(t, U_j))  (up to deterministic loadings)
+
+        The frozen weights are:
+          c(T0) += P(0,T0)/A0
+          c(Tn) += -P(0,Tn)/A0
+          c(Ti) += -(S0/A0) * Delta_i * P(0,Ti) for i=1..n
+        (So the last date Tn has two contributions: numerator + annuity.)
+        """
+        A0, S0 = self._annuity_and_swap_rate_0(Tau)
+
+        U = [float(x) for x in Tau]
+        m = len(U)
+        c = np.zeros(m, dtype=float)
+
+        # Numerator contributions: +P(0,T0)/A0 and -P(0,Tn)/A0
+        c[0] += self.discount_factor(U[0]) / A0
+        c[-1] += -self.discount_factor(U[-1]) / A0
+
+        # Annuity contribution: -(S0/A0) * Delta_i * P(0,Ti)
+        for i in range(1, m):
+            Ti = U[i]
+            delta = U[i] - U[i - 1]
+            c[i] += -(S0 / A0) * delta * self.discount_factor(Ti)
+
+        return U, c, A0, S0
+
+    # ---------------------------------------
+    # HW2F bond options (closed form via v^2)
+    # ---------------------------------------
+
+    def zero_bond_put_hw2f(self, T: float, S: float, K: float) -> float:
+        """
+        Put option on ZC bond P(T,S) with strike K (bond price strike), priced at time 0.
+
+        Put = K P(0,T) N(-d2) - P(0,S) N(-d1)
+        d1 = [ln(P(0,S)/(K P(0,T))) + 0.5 v^2]/v
+        d2 = d1 - v
+        where v^2 = model.v2_caplet(T,S).
+        """
+        T = float(T)
+        S = float(S)
+        K = float(K)
+        if S <= T:
+            raise ValueError("Bond option requires S > T.")
+        if K <= 0:
+            raise ValueError("Bond option strike K must be > 0.")
+
+        P0T = self.discount_factor(T)
+        P0S = self.discount_factor(S)
+
+        v2 = self.model.v2_caplet(T, S)
+        v = np.sqrt(max(v2, 0.0))
+
+        if v < 1e-16:
+            # Nearly deterministic
+            return float(max(K * P0T - P0S, 0.0))
+
+        ln_term = np.log(P0S / (K * P0T))
+        d1 = (ln_term + 0.5 * v2) / v
+        d2 = d1 - v
+
+        put = K * P0T * norm.cdf(-d2) - P0S * norm.cdf(-d1)
+        return float(put)
+
+    def zero_bond_call_hw2f(self, T: float, S: float, K: float) -> float:
+        """
+        Call option on ZC bond P(T,S), priced at time 0.
+
+        Call = P(0,S) N(d1) - K P(0,T) N(d2)
+        """
+        T = float(T)
+        S = float(S)
+        K = float(K)
+        if S <= T:
+            raise ValueError("Bond option requires S > T.")
+        if K <= 0:
+            raise ValueError("Bond option strike K must be > 0.")
+
+        P0T = self.discount_factor(T)
+        P0S = self.discount_factor(S)
+
+        v2 = self.model.v2_caplet(T, S)
+        v = np.sqrt(max(v2, 0.0))
+
+        if v < 1e-16:
+            return float(max(P0S - K * P0T, 0.0))
+
+        ln_term = np.log(P0S / (K * P0T))
+        d1 = (ln_term + 0.5 * v2) / v
+        d2 = d1 - v
+
+        call = P0S * norm.cdf(d1) - K * P0T * norm.cdf(d2)
+        return float(call)
+
+    # -----------------------
+    # Caplet pricing under 2F
+    # -----------------------
+
+    def caplet_hw2f(self, T1: float, T2: float, N: float, K: float) -> float:
+        """
+        Caplet PV under HW2F via ZC bond put:
+            Caplet = N * (1 + K*Delta) * PutZC(T1, T2, 1/(1+K*Delta))
+        with Delta = T2 - T1.
+        """
+        T1 = float(T1)
+        T2 = float(T2)
+        N = float(N)
+        K = float(K)
+
+        if T2 <= T1:
+            raise ValueError("Caplet requires T2 > T1.")
+        if N <= 0:
+            raise ValueError("Notional N must be > 0.")
+        if K < 0:
+            raise ValueError("Strike K must be >= 0.")
+
+        Delta = T2 - T1
+        K_bond = 1.0 + K * Delta
+        if K_bond <= 0:
+            raise ValueError("Invalid (1 + K*Delta) <= 0.")
+
+        # Bond option strike on P(T1, T2)
+        K_zc = 1.0 / K_bond
+
+        put_zc = self.zero_bond_put_hw2f(T1, T2, K_zc)
+        caplet = N * K_bond * put_zc
+        return float(caplet)
+
+    # ----------------------------------------------
+    # Swaption pricing under 2F via Gaussian approx
+    # ----------------------------------------------
+
+    def swaption_approx_hw2f(self, Tau, N: float, K: float, payer: bool = True) -> float:
+        """
+        Swaption PV using:
+          - frozen weights Gaussian swap-rate approximation
+          - HW2F closed-form integrals I_aa, I_bb, I_ab
+          - Bachelier (normal) pricing on swap rate
+
+        Tau : list[float]
+            [T0, T1, ..., Tn] fixed payment schedule (T0 is option expiry / swap start)
+        """
+        Tau = [float(x) for x in Tau]
+        N = float(N)
+        K = float(K)
+        if len(Tau) < 2:
+            raise ValueError("Tau must contain at least [T0, Tn].")
+        if N <= 0:
+            raise ValueError("Notional N must be > 0.")
+
+        T = Tau[0]  # expiry
+        if T <= 0:
+            raise ValueError("Swaption expiry T must be > 0 for this method.")
+
+        # Build frozen weights and swap quantities at time 0
+        U, c, A0, S0 = self._swaption_weights_frozen(Tau)
+
+        # Model parameters
+        a = self.model.parameters["a"]
+        b = self.model.parameters["b"]
+        rho = self.model.parameters["rho"]
+        sigma = self.model.parameters["sigma"]
+        eta = self.model.parameters["eta"]
+
+        # Compute Qaa, Qbb, Qab via double sums (small matrices => fine)
+        Qaa = 0.0
+        Qbb = 0.0
+        Qab = 0.0
+
+        for i, Ui in enumerate(U):
+            ci = c[i]
+            if ci == 0.0:
+                continue
+            for j, Uj in enumerate(U):
+                cj = c[j]
+                if cj == 0.0:
+                    continue
+                Qaa += ci * cj * HullWhite2FModel.I_aa(T, Ui, Uj, a)
+                Qbb += ci * cj * HullWhite2FModel.I_bb(T, Ui, Uj, b)
+                Qab += ci * cj * HullWhite2FModel.I_ab(T, Ui, Uj, a, b)
+
+        varS = (sigma * sigma) * Qaa + (eta * eta) * Qbb + 2.0 * rho * sigma * eta * Qab
+        varS = float(max(varS, 0.0))
+
+        # Convert to normal vol on swap rate
+        if varS < 1e-30:
+            w = 1.0 if payer else -1.0
+            return float(N * A0 * max(w * (S0 - K), 0.0))
+
+        sigmaN = np.sqrt(varS / T)
+
+        # Bachelier pricing
+        d = (S0 - K) / (sigmaN * np.sqrt(T))
+        w = 1.0 if payer else -1.0
+
+        price = N * A0 * (w * (S0 - K) * norm.cdf(w * d) + sigmaN * np.sqrt(T) * norm.pdf(d))
+        return float(price)
+
+
+### FILE: ir\risk\hw2f_sim.py
+# -*- coding: utf-8 -*-
+"""
+hw2f_sim.py
+
+Minimal Monte Carlo wrapper for Hull–White 2F (G2++) to generate distributions of
+zero-coupon bond prices P(t,T).
+
+This file is extracted from your notebook so you can import it later without
+copy/pasting cells.
+
+Notes (important for "same results as notebook")
+-----------------------------------------------
+- By default, this class uses NumPy's *global* RNG (np.random.seed(seed)) exactly
+  like your notebook cell. That means results are reproducible but also depend
+  on other random draws in your session.
+- Each call to zero_coupon_bond(t, T) draws fresh (x_t, y_t). This matches your
+  notebook's behavior. (It does *not* reuse the same factors across maturities.)
+"""
+
+from __future__ import annotations
+import numpy as np
+
+
+class HW2FCurveSim:
+    """
+    Minimal simulation wrapper for HW2F to mimic curve_sim in your 1F code.
+
+    Provides:
+      - zero_coupon_bond(t, T): ndarray of P(t,T) over n_paths
+
+    Parameters
+    ----------
+    curve:
+        Your Curve instance (must provide discount(t)).
+    model:
+        HullWhite2FModel instance (must provide B_a, B_b, v2_caplet and parameters).
+    n_paths:
+        Number of Monte Carlo paths.
+    seed:
+        Random seed used when use_legacy_global_seed=True.
+    use_legacy_global_seed:
+        If True (default), call np.random.seed(seed) and draw via np.random.normal
+        to match your notebook cell behavior.
+        If False, uses a local Generator (recommended for isolation).
+    """
+
+    def __init__(
+        self,
+        curve,
+        model,
+        n_paths: int = 20000,
+        seed: int = 2025,
+        use_legacy_global_seed: bool = True,
+    ):
+        self.curve = curve
+        self.model = model
+        self.n_paths = int(n_paths)
+
+        self._use_legacy = bool(use_legacy_global_seed)
+        if self._use_legacy:
+            np.random.seed(seed)
+            self._rng = None
+        else:
+            self._rng = np.random.default_rng(seed)
+
+    # -------------------------
+    # Internal random utilities
+    # -------------------------
+
+    def _normal(self, size: int) -> np.ndarray:
+        if self._use_legacy:
+            return np.random.normal(size=size)
+        return self._rng.normal(size=size)
+
+    # -------------------------
+    # Exact joint Gaussian draw
+    # -------------------------
+
+    def _simulate_xy(self, t: float) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Exact joint Gaussian simulation of (x_t, y_t) under Q:
+          x_t = sigma ∫ e^{-a(t-s)} dW1
+          y_t = eta   ∫ e^{-b(t-s)} dW2
+          corr(dW1,dW2)=rho
+        """
+        t = float(t)
+
+        if t <= 1e-16:
+            x = np.zeros(self.n_paths)
+            y = np.zeros(self.n_paths)
+            return x, y
+
+        a = float(self.model.parameters["a"])
+        b = float(self.model.parameters["b"])
+        rho = float(self.model.parameters["rho"])
+        sigma = float(self.model.parameters["sigma"])
+        eta = float(self.model.parameters["eta"])
+
+        vx = (sigma**2 / (2.0 * a)) * (1.0 - np.exp(-2.0 * a * t))
+        vy = (eta**2   / (2.0 * b)) * (1.0 - np.exp(-2.0 * b * t))
+        cxy = (rho * sigma * eta / (a + b)) * (1.0 - np.exp(-(a + b) * t))
+
+        # Sample correlated normals via stable 2x2 construction
+        z1 = self._normal(self.n_paths)
+        z2 = self._normal(self.n_paths)
+
+        sx = np.sqrt(max(vx, 0.0))
+        alpha = cxy / (sx + 1e-18)
+        beta2 = vy - alpha**2
+        beta = np.sqrt(max(beta2, 0.0))
+
+        x = sx * z1
+        y = alpha * z1 + beta * z2
+        return x, y
+
+    # -------------------------
+    # ZC bond distribution
+    # -------------------------
+
+    def zero_coupon_bond(self, t: float, T: float) -> np.ndarray:
+        """
+        Distribution of P(t,T) over paths using affine Gaussian form:
+          P(t,T) = P(0,T)/P(0,t) * exp( -B_a x_t - B_b y_t - 0.5 v^2(t,T) )
+
+        where v^2(t,T) is taken from model.v2_caplet(expiry=t, maturity=T)
+        (this matches your notebook implementation).
+        """
+        t = float(t)
+        T = float(T)
+
+        if T < t - 1e-12:
+            raise ValueError("Need T >= t for P(t,T).")
+        if abs(T - t) < 1e-12:
+            return np.ones(self.n_paths)
+
+        ratio = float(self.curve.discount(T)) / (float(self.curve.discount(t)) + 1e-18)
+
+        x, y = self._simulate_xy(t)
+
+        Ba = float(self.model.B_a(t, T))
+        Bb = float(self.model.B_b(t, T))
+        v2 = float(self.model.v2_caplet(t, T))
+        adj = -0.5 * v2
+
+        return ratio * np.exp(-Ba * x - Bb * y + adj)
+
+
+### FILE: ir\risk\pfe_plot.py
+# -*- coding: utf-8 -*-
+"""
+pfe_plot.py
+
+Plot helpers for PFE/EPE profiles (matplotlib).
+Extracted from your notebook so you can import it later.
+"""
+
+from __future__ import annotations
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+
+
+def _human_money(x, pos=None) -> str:
+    """Format 1200 -> 1.2k, 1200000 -> 1.2M."""
+    x = float(x)
+    ax = abs(x)
+    if ax >= 1e9:
+        return f"{x/1e9:.1f}B"
+    if ax >= 1e6:
+        return f"{x/1e6:.1f}M"
+    if ax >= 1e3:
+        return f"{x/1e3:.1f}k"
+    return f"{x:.0f}"
+
+
+def plot_pfe_profile(
+    grid,
+    pfe,
+    epe=None,
+    q: float = 0.95,
+    title: str = "PFE profile",
+    subtitle: str | None = None,
+    xlabel: str = "Time (years)",
+    ylabel: str = "Exposure",
+    show_fill: bool = True,
+    annotate_peak: bool = True,
+    savepath: str | None = None,
+):
+    """
+    Plot a clean PFE profile (and optionally EPE).
+
+    Parameters
+    ----------
+    grid : array-like
+        Time grid in years.
+    pfe : array-like
+        PFE values (same length as grid).
+    epe : array-like, optional
+        EPE values (same length as grid).
+    q : float
+        Quantile used for PFE (e.g., 0.95, 0.975, 0.99).
+    subtitle : str, optional
+        Additional context line (swap details, notional, K, model params...).
+    show_fill : bool
+        If True, fill under PFE curve (subtle).
+    annotate_peak : bool
+        If True, annotate max PFE point.
+    savepath : str, optional
+        If provided, saves figure as PNG.
+
+    Returns
+    -------
+    (fig, ax)
+    """
+    grid = np.asarray(grid, dtype=float)
+    pfe = np.asarray(pfe, dtype=float)
+    if epe is not None:
+        epe = np.asarray(epe, dtype=float)
+
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+
+    label_pfe = f"PFE ({int(q*100)}%)"
+    ax.plot(grid, pfe, marker="o", markersize=3.5, linewidth=2.0, label=label_pfe)
+
+    if show_fill:
+        ax.fill_between(grid, 0.0, pfe, alpha=0.12)
+
+    if epe is not None:
+        ax.plot(grid, epe, marker="s", markersize=3.2, linewidth=1.8, linestyle="--", label="EPE")
+
+    ax.set_title(title, fontsize=14, fontweight="bold", pad=10)
+    if subtitle:
+        ax.text(0.0, 1.02, subtitle, transform=ax.transAxes, fontsize=10, alpha=0.9, va="bottom")
+
+    ax.set_xlabel(xlabel, fontsize=11)
+    ax.set_ylabel(ylabel, fontsize=11)
+    ax.yaxis.set_major_formatter(FuncFormatter(_human_money))
+    ax.grid(True, alpha=0.25)
+
+    ax.set_xlim(grid.min(), grid.max())
+    ax.set_ylim(bottom=0.0)
+
+    if annotate_peak and len(pfe) > 0:
+        i_max = int(np.argmax(pfe))
+        t_max = grid[i_max]
+        pfe_max = pfe[i_max]
+        ax.scatter([t_max], [pfe_max], s=45, zorder=5)
+        ax.annotate(
+            f"Peak: {pfe_max:,.0f} at {t_max:.2f}y",
+            xy=(t_max, pfe_max),
+            xytext=(10, 10),
+            textcoords="offset points",
+            fontsize=10,
+            arrowprops=dict(arrowstyle="->", lw=1.0, alpha=0.8),
+        )
+
+    ax.legend(frameon=True, fontsize=10, loc="upper right")
+    plt.tight_layout()
+
+    if savepath:
+        fig.savefig(savepath, dpi=200, bbox_inches="tight")
+
+    plt.show()
+    return fig, ax
+
+
+### FILE: ir\risk\pfe_swap.py
+# -*- coding: utf-8 -*-
+"""
+pfe_swap.py
+
+Exposure / PFE utilities for a vanilla IRS (swap) under a curve simulator.
+
+Compatibility
+-------------
+Works with:
+- HullWhiteCurveBuilder (1F): object has zero_coupon_bond(t,T) and sim.n_paths
+- HW2FCurveSim (2F): object has zero_coupon_bond(t,T) and n_paths
+
+Patch (progress)
+----------------
+- Adds optional progress callback to display live progress in Streamlit:
+  * per grid node (always)
+  * optional intra-node progress (per cashflow) for long Tau schedules
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Callable, Optional, Dict, Any
+
+import numpy as np
+
+
+def _get_n_paths(curve_sim) -> int:
+    """
+    Try to infer the number of Monte Carlo paths from the simulator object.
+    """
+    if hasattr(curve_sim, "n_paths"):
+        return int(curve_sim.n_paths)
+    if hasattr(curve_sim, "sim") and hasattr(curve_sim.sim, "n_paths"):
+        return int(curve_sim.sim.n_paths)
+    raise AttributeError(
+        "Cannot infer number of paths. Expected curve_sim.n_paths or curve_sim.sim.n_paths."
+    )
+
+
+def swap_mtm_distribution_at_t(
+    curve_sim,
+    t: float,
+    Tau,
+    K: float,
+    N: float,
+    payer: bool = True,
+    progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
+    progress_ctx: Optional[Dict[str, Any]] = None,
+    inner_progress: bool = False,
+    inner_every: int = 3,
+) -> np.ndarray:
+    """
+    Distribution de V(t) (PV à t) d'un swap vanilla.
+
+    Parameters
+    ----------
+    curve_sim:
+        Any object exposing zero_coupon_bond(t,T) -> ndarray.
+    t:
+        Evaluation time in years.
+    Tau:
+        Payment schedule [T0, T1, ..., Tm].
+    K:
+        Fixed rate (in rate units, e.g. 0.03 for 3%).
+    N:
+        Notional.
+    payer:
+        True for payer swap, False for receiver swap.
+    progress_cb:
+        Optional callback called during computation (to update UI).
+    progress_ctx:
+        Context dict (e.g. {"grid_i":..., "grid_n":...}) merged into callback payload.
+    inner_progress:
+        If True, calls progress_cb during annuity loop (cashflow-by-cashflow).
+    inner_every:
+        Call progress_cb every `inner_every` cashflows (to avoid too frequent UI updates).
+
+    Returns
+    -------
+    ndarray shape (n_paths,)
+        Distribution of V(t) across paths.
+    """
+    w = 1.0 if payer else -1.0
+    t = float(t)
+    K = float(K)
+    N = float(N)
+
+    Tau_rem = [float(Ti) for Ti in Tau if float(Ti) >= t - 1e-12]
+    if len(Tau_rem) < 2:
+        return np.zeros(_get_n_paths(curve_sim), dtype=float)
+
+    ctx = dict(progress_ctx or {})
+    ctx.update({"t": t})
+
+    T0 = Tau_rem[0]
+    Tm = Tau_rem[-1]
+
+    # ZC for float leg endpoints
+    P_t_T0 = curve_sim.zero_coupon_bond(t, T0)
+    P_t_Tm = curve_sim.zero_coupon_bond(t, Tm)
+
+    # fixed leg annuity
+    annuity = 0.0
+    n_cf = max(len(Tau_rem) - 1, 0)
+
+    for i in range(1, len(Tau_rem)):
+        Ti = Tau_rem[i]
+        Delta = Tau_rem[i] - Tau_rem[i - 1]
+        P_t_Ti = curve_sim.zero_coupon_bond(t, Ti)
+        annuity += Delta * P_t_Ti
+
+        if inner_progress and progress_cb is not None and n_cf > 0:
+            # throttle UI updates
+            is_last = (i == len(Tau_rem) - 1)
+            if is_last or (inner_every > 0 and (i % inner_every == 0)):
+                payload = {
+                    **ctx,
+                    "stage": "cashflows",
+                    "cf_i": int(i),
+                    "cf_n": int(n_cf),
+                    "Ti": float(Ti),
+                }
+                progress_cb(payload)
+
+    float_leg = P_t_T0 - P_t_Tm
+    fixed_leg = K * annuity
+
+    V_t = N * w * (float_leg - fixed_leg)
+    return V_t
+
+
+def pfe_profile_swap(
+    curve_sim,
+    grid,
+    Tau,
+    K: float,
+    N: float,
+    payer: bool = True,
+    q: float = 0.95,
+    progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
+    inner_progress: bool = False,
+    inner_every: int = 3,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Retourne PFE_q(t) et EPE(t) sur une grille.
+
+    Parameters
+    ----------
+    curve_sim:
+        Simulator with zero_coupon_bond(t,T) -> ndarray.
+    grid:
+        Times where to compute exposures.
+    Tau:
+        Swap payment schedule.
+    K, N, payer:
+        Swap specs.
+    q:
+        Quantile level for PFE (e.g. 0.95).
+    progress_cb:
+        Optional callback called during the run to update UI with progress.
+        Payload keys (typical):
+          - stage: "grid" or "cashflows"
+          - grid_i, grid_n, t
+          - done, total, pct
+          - elapsed_s, eta_s
+          - pfe_t, epe_t (for stage="grid")
+    inner_progress:
+        If True, emits extra progress during the cashflow loop inside each grid node.
+    inner_every:
+        Throttle for inner progress updates.
+
+    Returns
+    -------
+    (pfe, epe): tuple of ndarrays
+        Arrays aligned with grid.
+    """
+    t0 = time.perf_counter()
+    grid = np.asarray(grid, dtype=float)
+
+    pfe = np.zeros(len(grid), dtype=float)
+    epe = np.zeros(len(grid), dtype=float)
+
+    total_steps = int(len(grid))
+    n_paths = _get_n_paths(curve_sim)
+
+    for j, t in enumerate(grid, start=1):
+        ctx = {"grid_i": int(j), "grid_n": int(total_steps), "n_paths": int(n_paths)}
+
+        V_t = swap_mtm_distribution_at_t(
+            curve_sim,
+            float(t),
+            Tau,
+            K,
+            N,
+            payer=payer,
+            progress_cb=progress_cb,
+            progress_ctx=ctx,
+            inner_progress=inner_progress,
+            inner_every=inner_every,
+        )
+
+        V_pos = np.maximum(V_t, 0.0)
+        pfe_t = float(np.quantile(V_pos, q))
+        epe_t = float(np.mean(V_pos))
+
+        pfe[j - 1] = pfe_t
+        epe[j - 1] = epe_t
+
+        if progress_cb is not None:
+            elapsed = time.perf_counter() - t0
+            pct = j / max(total_steps, 1)
+            eta = (elapsed / pct - elapsed) if pct > 1e-12 else None
+
+            progress_cb(
+                {
+                    "stage": "grid",
+                    "grid_i": int(j),
+                    "grid_n": int(total_steps),
+                    "t": float(t),
+                    "done": int(j),
+                    "total": int(total_steps),
+                    "pct": float(pct),
+                    "elapsed_s": float(elapsed),
+                    "eta_s": (float(eta) if eta is not None and np.isfinite(eta) else None),
+                    "pfe_t": float(pfe_t),
+                    "epe_t": float(epe_t),
+                    "n_paths": int(n_paths),
+                }
+            )
+
+    return pfe, epe
+
+
+### FILE: streamlit_app\app.py
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+import streamlit as st
+
+# Ensure project root is importable (so "import ir...." works)
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from streamlit_app.ui.db import init_db
+
+st.set_page_config(
+    page_title="IR Lab | Hull-White",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+init_db()
+
+# --- Global sidebar ---
+with st.sidebar:
+    st.markdown("## IR Lab")
+    st.caption("Hull–White 1F / 2F • Calibration • PFE • Tracking")
+
+    tracking = st.toggle("📌 Portfolio tracking mode", value=True)
+    st.session_state["tracking_mode"] = tracking
+
+    st.divider()
+    st.markdown("### Quick tips")
+    st.markdown(
+        "- Calibre dans **HW1F** ou **HW2F**\n"
+        "- Va dans **PFE Swap** pour lancer l’expo\n"
+        "- Sauvegarde un run dans **Portfolio Tracking**"
+    )
+
+st.title("📈 IR Lab — Hull–White Playground")
+st.write(
+    "Utilise le menu de gauche (pages) pour naviguer : calibration 1F/2F, PFE, tracking, explorer."
+)
+
+st.info(
+    "Pages disponibles : Overview • Calibration HW1F • Calibration HW2F • PFE Swap • Portfolio Tracking • Project Explorer",
+    icon="ℹ️",
+)
+
+
+### FILE: streamlit_app\__init__.py
+
+
+### FILE: streamlit_app\pages\1_Overview.py
+import streamlit as st
+
+st.markdown("# Overview")
+st.write(
+    "Cette app expose :\n"
+    "- Calibration Hull–White **1F** (a, sigma)\n"
+    "- Calibration Hull–White **2F (G2++)** (a,b,rho) + inner (sigma,eta)\n"
+    "- **PFE / EPE** swap via Monte Carlo (1F et 2F)\n"
+    "- **Portfolio tracking** : historique de runs, comparaison, export\n"
+    "- **Project explorer** : navigation dans le code"
+)
+
+st.success("Astuce : commence par `Calibration HW1F` ou `Calibration HW2F`, puis va sur `PFE Swap`.", icon="✅")
+
+
+### FILE: streamlit_app\pages\2_Calibration_HW1F.py
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+from streamlit_app.ui.io import load_curve_and_swaption_from_upload
+from streamlit_app.ui.capture import capture_stdout
+from streamlit_app.ui.plotting import fig_curve, fig_prices_by_tenor, fig_vols_by_tenor
+
+from ir.pricers.hw1f_pricer import HullWhitePricer
+from ir.calibration.hw1f_calibration import HullWhiteCalibrator
+from ir.calibration.vol import black_normal_vol
+from streamlit_app.ui.db import save_run, curve_to_dict
+
+
+def ensure_expiry_tenor(df: pd.DataFrame, dates_col="Payment_Dates"):
+    if "Expiry" not in df.columns:
+        df["Expiry"] = df[dates_col].apply(lambda L: float(L[0]))
+    if "Tenor" not in df.columns:
+        df["Tenor"] = df[dates_col].apply(lambda L: float(L[-1]) - float(L[0]))
+
+
+def par_rate(curve, Tau):
+    Tau = [float(x) for x in Tau]
+    T0, Tn = Tau[0], Tau[-1]
+    A0 = 0.0
+    for i in range(1, len(Tau)):
+        Ti = Tau[i]
+        d = Tau[i] - Tau[i - 1]
+        A0 += d * float(curve.discount(Ti))
+    S0 = (float(curve.discount(T0)) - float(curve.discount(Tn))) / (A0 + 1e-18)
+    return A0, S0
+
+
+def add_implied_normal_vols_forward_premium(
+    df: pd.DataFrame,
+    curve,
+    price_col="Price",
+    model_col="Model_Price",
+    strike_col="Strike",
+    dates_col="Payment_Dates",
+):
+    mkt_vol, mdl_vol = [], []
+    for _, row in df.iterrows():
+        Tau = row[dates_col]
+        T0 = float(Tau[0])
+        DF0 = float(curve.discount(T0))
+        A0, S0 = par_rate(curve, Tau)
+        annuity_fwd = A0 / (DF0 + 1e-18)
+
+        strike_pct = float(row[strike_col])  # %
+        forward_pct = 100.0 * float(S0)      # %
+        notional = float(row.get("Notional", 1.0))
+
+        p_mkt = float(row[price_col])
+        p_mdl = float(row[model_col])
+
+        mkt_vol.append(black_normal_vol(p_mkt, forward_pct, strike_pct, T0, notional, annuity_fwd))
+        mdl_vol.append(black_normal_vol(p_mdl, forward_pct, strike_pct, T0, notional, annuity_fwd))
+
+    df["Market_Vol (Bps)"] = mkt_vol
+    df["Model_Vol (Bps)"] = mdl_vol
+
+
+st.markdown("# Calibration — Hull–White 1F")
+st.caption("Calibrage sur swaptions (forward premium) + plots + sauvegarde en session.")
+
+colL, colR = st.columns([1.0, 1.2], gap="large")
+
+with colL:
+    uploaded = st.file_uploader("Upload SWPN calibration template (.xlsx)", type=["xlsx"])
+    curve_sheet = st.text_input("Curve sheet", value="Curve")
+    template_sheet = st.text_input("Template sheet", value="Template")
+    smooth = st.number_input("Curve smoothing", value=1e-7, format="%.1e")
+
+    st.divider()
+    st.subheader("Calibration settings")
+    init_a = st.number_input("init a", value=0.01, format="%.6f")
+    init_sigma = st.number_input("init sigma", value=0.01, format="%.6f")
+    method = st.selectbox("Optimizer", ["L-BFGS-B", "Nelder-Mead"], index=0)
+
+    do_calibrate = st.button("🚀 Run calibration (HW1F)", type="primary", use_container_width=True)
+
+with colR:
+    if uploaded is None:
+        st.info("Upload un fichier .xlsx pour commencer.", icon="📄")
+        st.stop()
+
+    source_path, curve, swpn = load_curve_and_swaption_from_upload(
+        uploaded, curve_sheet=curve_sheet, template_sheet=template_sheet, smooth=smooth
+    )
+
+    st.session_state["last_source_file"] = uploaded.name
+
+    st.subheader("Market curve")
+    st.pyplot(fig_curve(curve, title_prefix="Market"), clear_figure=True)
+
+    st.subheader("Template preview")
+    st.dataframe(swpn.df.head(15), use_container_width=True, height=260)
+
+    status_ph = st.empty()
+    progress_ph = st.empty()
+
+    if do_calibrate:
+        st.session_state["hw1f_progress_rows"] = []
+
+        def progress_cb(d: dict):
+            rows = st.session_state.get("hw1f_progress_rows", [])
+            rows.append(d)
+            st.session_state["hw1f_progress_rows"] = rows
+
+            status_ph.markdown(
+                f"**Calibration en cours** — itération **{d['iter']}**  \n"
+                f"`a={d['a']:.6f}`  |  `sigma={d['sigma']:.6f}`  |  `RMSRE={d['rmsre']:.2e}`"
+            )
+
+            dfp = pd.DataFrame(rows)
+            progress_ph.dataframe(
+                dfp.tail(20),
+                use_container_width=True,
+                hide_index=True,
+                height=240,
+            )
+
+        with st.spinner("Calibration HW1F en cours..."):
+            pricer_1f = HullWhitePricer(curve, n_paths=20000, seed=2025)
+            mkt_dict = swpn.to_market_dict()
+
+            cal = HullWhiteCalibrator(
+                pricer_1f,
+                mkt_dict,
+                calibrate_to="Swaptions",
+                progress_cb=progress_cb,
+            )
+
+            result_obj, logs = capture_stdout(
+                cal.calibrate,
+                init_a=init_a,
+                init_sigma=init_sigma,
+                method=method,
+            )
+
+            st.session_state["hw1f_pricer"] = pricer_1f
+            st.session_state["hw1f_logs"] = logs
+            st.session_state["hw1f_result"] = result_obj
+
+        try:
+            final_a = float(pricer_1f.model.parameters.get("a", np.nan))
+            final_sigma = float(pricer_1f.model.parameters.get("sigma", np.nan))
+            final_rmsre = float(getattr(result_obj, "fun", np.nan))
+            status_ph.success(
+                f"Calibration terminée ✅  |  a={final_a:.6f}  sigma={final_sigma:.6f}  RMSRE={final_rmsre:.2e}",
+                icon="✅",
+            )
+        except Exception:
+            status_ph.success("Calibration terminée ✅", icon="✅")
+
+    if "hw1f_pricer" in st.session_state:
+        pricer_1f = st.session_state["hw1f_pricer"]
+
+        st.subheader("Calibration logs")
+        with st.expander("Voir logs (print calibrator)", expanded=False):
+            st.code(st.session_state.get("hw1f_logs", ""), language="text")
+
+        rows = st.session_state.get("hw1f_progress_rows", [])
+        if rows:
+            with st.expander("Progress (itérations)", expanded=False):
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=260)
+
+        st.subheader("Market vs Model")
+        df_1f = swpn.with_model_prices_1f(pricer_1f, forward_premium=True)
+        ensure_expiry_tenor(df_1f)
+
+        st.dataframe(
+            df_1f[["Expiry", "Tenor", "Strike", "Price", "Model_Price", "Rel_Error"]].head(30),
+            use_container_width=True,
+            height=260,
+        )
+
+        st.pyplot(
+            fig_prices_by_tenor(df_1f, mkt_col="Price", model_col="Model_Price", ylabel="Forward Premium"),
+            clear_figure=True,
+        )
+
+        with st.spinner("Implied vols (Bachelier) ..."):
+            dfv = df_1f.copy()
+            add_implied_normal_vols_forward_premium(dfv, curve)
+
+        st.pyplot(
+            fig_vols_by_tenor(dfv, mkt_col="Market_Vol (Bps)", model_col="Model_Vol (Bps)"),
+            clear_figure=True,
+        )
+
+        params = dict(pricer_1f.model.parameters)
+        rmsre = None
+        try:
+            rmsre = float(getattr(st.session_state.get("hw1f_result", None), "fun", np.nan))
+        except Exception:
+            rmsre = None
+
+        # <<< NEW: keep curve snapshot in session for Portfolio Tracking save_run()
+        curve_snapshot = curve_to_dict(curve)
+        st.session_state["last_curve_snapshot"] = curve_snapshot
+
+        st.session_state["last_run"] = {
+            "model": "HW1F",
+            "source_file": st.session_state.get("last_source_file"),
+            "params": params,
+            "rmsre": rmsre,
+            "artifacts": {},
+            "curve_snapshot": curve_snapshot,  # <<< NEW
+        }
+
+        st.info("Tu peux maintenant aller sur **PFE Swap** (page 4).", icon="➡️")
+
+
+### FILE: streamlit_app\pages\3_Calibration_HW2F.py
+from __future__ import annotations
+
+import pandas as pd
+import streamlit as st
+
+from streamlit_app.ui.io import load_curve_and_swaption_from_upload
+from streamlit_app.ui.capture import capture_stdout
+from streamlit_app.ui.plotting import fig_curve, fig_prices_by_tenor, fig_vols_by_tenor
+
+from ir.pricers.hw2f_pricer import HullWhite2FPricer
+from ir.calibration.hw2f_profile import HullWhite2FProfileCalibrator
+from ir.calibration.vol import black_normal_vol
+from streamlit_app.ui.db import curve_to_dict
+
+
+def ensure_expiry_tenor(df: pd.DataFrame, dates_col="Payment_Dates"):
+    if "Expiry" not in df.columns:
+        df["Expiry"] = df[dates_col].apply(lambda L: float(L[0]))
+    if "Tenor" not in df.columns:
+        df["Tenor"] = df[dates_col].apply(lambda L: float(L[-1]) - float(L[0]))
+
+
+def par_rate(curve, Tau):
+    Tau = [float(x) for x in Tau]
+    T0, Tn = Tau[0], Tau[-1]
+    A0 = 0.0
+    for i in range(1, len(Tau)):
+        Ti = Tau[i]
+        d = Tau[i] - Tau[i - 1]
+        A0 += d * float(curve.discount(Ti))
+    S0 = (float(curve.discount(T0)) - float(curve.discount(Tn))) / (A0 + 1e-18)
+    return A0, S0
+
+
+def add_implied_normal_vols_forward_premium(
+    df: pd.DataFrame,
+    curve,
+    price_col="Price",
+    model_col="Model_Price",
+    strike_col="Strike",
+    dates_col="Payment_Dates",
+):
+    mkt_vol, mdl_vol = [], []
+    for _, row in df.iterrows():
+        Tau = row[dates_col]
+        T0 = float(Tau[0])
+        DF0 = float(curve.discount(T0))
+        A0, S0 = par_rate(curve, Tau)
+        annuity_fwd = A0 / (DF0 + 1e-18)
+
+        strike_pct = float(row[strike_col])
+        forward_pct = 100.0 * float(S0)
+        notional = float(row.get("Notional", 1.0))
+
+        p_mkt = float(row[price_col])
+        p_mdl = float(row[model_col])
+
+        mkt_vol.append(black_normal_vol(p_mkt, forward_pct, strike_pct, T0, notional, annuity_fwd))
+        mdl_vol.append(black_normal_vol(p_mdl, forward_pct, strike_pct, T0, notional, annuity_fwd))
+
+    df["Market_Vol (Bps)"] = mkt_vol
+    df["Model_Vol (Bps)"] = mdl_vol
+
+
+st.markdown("# Calibration — Hull–White 2F (G2++)")
+st.caption("Profile calibration : outer (a,b,rho) + inner (sigma,eta) + live progress.")
+
+colL, colR = st.columns([1.0, 1.2], gap="large")
+
+with colL:
+    uploaded = st.file_uploader("Upload SWPN calibration template (.xlsx)", type=["xlsx"], key="hw2f_upload")
+    curve_sheet = st.text_input("Curve sheet", value="Curve", key="hw2f_curve_sheet")
+    template_sheet = st.text_input("Template sheet", value="Template", key="hw2f_template_sheet")
+    smooth = st.number_input("Curve smoothing", value=1e-7, format="%.1e", key="hw2f_smooth")
+
+    st.divider()
+    st.subheader("Outer grid (coarse)")
+    grid_a = st.text_input("grid_a", value="0.01,0.02,0.05,0.10,0.20")
+    grid_b = st.text_input("grid_b", value="0.001,0.003,0.01,0.02,0.05")
+    grid_rho = st.text_input("grid_rho", value="-0.8,-0.5,-0.2,0.0,0.2")
+
+    st.subheader("Inner init")
+    init_sigma = st.number_input("init sigma", value=0.01, format="%.6f", key="hw2f_init_sigma")
+    init_eta = st.number_input("init eta", value=0.008, format="%.6f", key="hw2f_init_eta")
+
+    verbose_inner = st.checkbox("Verbose inner prints", value=False)
+    top_k = st.number_input("top_k candidates printed", value=3, step=1, min_value=1)
+
+    do_calibrate = st.button("🚀 Run profile calibration (HW2F)", type="primary", use_container_width=True)
+
+with colR:
+    if uploaded is None:
+        st.info("Upload un fichier .xlsx pour commencer.", icon="📄")
+        st.stop()
+
+    source_path, curve, swpn = load_curve_and_swaption_from_upload(
+        uploaded, curve_sheet=curve_sheet, template_sheet=template_sheet, smooth=smooth
+    )
+
+    st.session_state["last_source_file"] = uploaded.name
+
+    st.subheader("Market curve")
+    st.pyplot(fig_curve(curve, title_prefix="Market"), clear_figure=True)
+
+    st.subheader("Template preview")
+    st.dataframe(swpn.df.head(15), use_container_width=True, height=260)
+
+    # -------------------------------
+    # LIVE PROGRESS PLACEHOLDERS
+    # -------------------------------
+    status_ph = st.empty()
+    bar_ph = st.progress(0)
+    progress_ph = st.empty()
+
+    if do_calibrate:
+        st.session_state["hw2f_progress_rows"] = []
+
+        def _parse_list(s: str):
+            return [float(x.strip()) for x in s.split(",") if x.strip()]
+
+        ga = _parse_list(grid_a)
+        gb = _parse_list(grid_b)
+        gr = _parse_list(grid_rho)
+
+        def progress_cb(d: dict):
+            # store
+            rows = st.session_state.get("hw2f_progress_rows", [])
+            rows.append(d)
+            st.session_state["hw2f_progress_rows"] = rows
+
+            # progress %
+            outer_idx = int(d.get("outer_idx", 0) or 0)
+            outer_total = int(d.get("outer_total", 0) or 0)
+            pct = 0
+            if outer_total > 0:
+                pct = int(round(100 * outer_idx / max(outer_total, 1)))
+            bar_ph.progress(min(max(pct, 0), 100))
+
+            stage = d.get("stage", "")
+            a = d.get("a", None)
+            b = d.get("b", None)
+            rho = d.get("rho", None)
+            cand_rmsre = d.get("cand_rmsre", None)
+            best_rmsre = d.get("best_rmsre", None)
+            improved = d.get("improved", False)
+
+            if stage == "outer_start":
+                status_ph.markdown(
+                    f"**HW2F calibration en cours** — candidat **{outer_idx}/{outer_total}** ({pct}%)  \n"
+                    f"`a={a:.6f}` | `b={b:.6f}` | `rho={rho:.3f}`  \n"
+                    f"Best RMSRE so far: `{(best_rmsre if best_rmsre is not None else float('nan')):.2e}`"
+                )
+            elif stage == "outer_done":
+                status_ph.markdown(
+                    f"**HW2F calibration en cours** — candidat **{outer_idx}/{outer_total}** ({pct}%)  \n"
+                    f"`a={a:.6f}` | `b={b:.6f}` | `rho={rho:.3f}`  \n"
+                    f"Cand RMSRE: `{(cand_rmsre if cand_rmsre is not None else float('nan')):.2e}`  |  "
+                    f"Best: `{(best_rmsre if best_rmsre is not None else float('nan')):.2e}`"
+                    + ("  ✅ **NEW BEST**" if improved else "")
+                )
+            else:
+                # fallback
+                status_ph.markdown(f"**HW2F calibration** — {outer_idx}/{outer_total} ({pct}%)")
+
+            # small live table (last 25)
+            dfp = pd.DataFrame(rows)
+            cols = [c for c in ["stage", "outer_idx", "outer_total", "a", "b", "rho", "cand_rmsre", "best_rmsre", "improved"] if c in dfp.columns]
+            progress_ph.dataframe(
+                dfp[cols].tail(25) if cols else dfp.tail(25),
+                use_container_width=True,
+                hide_index=True,
+                height=260,
+            )
+
+        with st.spinner("Calibration HW2F (profile) en cours..."):
+            pricer_2f = HullWhite2FPricer(curve)
+            mkt_dict = swpn.to_market_dict()
+
+            cal = HullWhite2FProfileCalibrator(
+                pricer_2f,
+                mkt_dict,
+                use_forward_premium=True,
+                progress_cb=progress_cb,  # <<< NEW (requires calibrator patch)
+            )
+
+            res, logs = capture_stdout(
+                cal.calibrate_profile,
+                grid_a=ga,
+                grid_b=gb,
+                grid_rho=gr,
+                init_sigma=init_sigma,
+                init_eta=init_eta,
+                verbose_inner=verbose_inner,
+                top_k=int(top_k),
+            )
+
+            st.session_state["hw2f_pricer"] = pricer_2f
+            st.session_state["hw2f_logs"] = logs
+            st.session_state["hw2f_profile_res"] = res
+
+        # final UI
+        try:
+            best = (res or {}).get("best", {}) if isinstance(res, dict) else {}
+            bar_ph.progress(100)
+            status_ph.success(
+                f"Calibration terminée ✅  |  Best RMSRE={(best.get('rmsre', float('nan'))):.2e}",
+                icon="✅",
+            )
+        except Exception:
+            bar_ph.progress(100)
+            status_ph.success("Calibration terminée ✅", icon="✅")
+
+    if "hw2f_pricer" in st.session_state:
+        pricer_2f = st.session_state["hw2f_pricer"]
+        res = st.session_state.get("hw2f_profile_res", {})
+        best = (res or {}).get("best", {})
+
+        st.subheader("Calibration logs")
+        with st.expander("Voir logs (print calibrator)", expanded=False):
+            st.code(st.session_state.get("hw2f_logs", ""), language="text")
+
+        rows = st.session_state.get("hw2f_progress_rows", [])
+        if rows:
+            with st.expander("Progress (candidats outer)", expanded=False):
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=320)
+
+        st.subheader("Best parameters")
+        st.json(best)
+
+        st.subheader("Market vs Model")
+        df_2f = swpn.with_model_prices_2f(pricer_2f, forward_premium=True)
+        ensure_expiry_tenor(df_2f)
+
+        st.dataframe(
+            df_2f[["Expiry", "Tenor", "Strike", "Price", "Model_Price", "Rel_Error"]].head(30),
+            use_container_width=True,
+            height=260,
+        )
+
+        st.pyplot(
+            fig_prices_by_tenor(df_2f, mkt_col="Price", model_col="Model_Price", ylabel="Forward Premium"),
+            clear_figure=True,
+        )
+
+        with st.spinner("Implied vols (Bachelier) ..."):
+            dfv = df_2f.copy()
+            add_implied_normal_vols_forward_premium(dfv, curve)
+        st.pyplot(fig_vols_by_tenor(dfv, mkt_col="Market_Vol (Bps)", model_col="Model_Vol (Bps)"), clear_figure=True)
+
+        params = dict(pricer_2f.model.parameters)
+        rmsre = best.get("rmsre", None)
+
+        curve_snapshot = curve_to_dict(curve)
+        st.session_state["last_curve_snapshot"] = curve_snapshot
+
+        st.session_state["last_run"] = {
+            "model": "HW2F",
+            "source_file": st.session_state.get("last_source_file"),
+            "params": params,
+            "rmsre": rmsre,
+            "artifacts": {},
+            "curve_snapshot": curve_snapshot,
+        }
+
+        st.info("Tu peux maintenant aller sur **PFE Swap** (page 4).", icon="➡️")
+
+
+### FILE: streamlit_app\pages\4_PFE_Swap.py
+# streamlit_app/pages/4_PFE_Swap.py
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+from streamlit_app.ui.plotting import fig_pfe
+from streamlit_app.ui.db import list_runs, get_run, format_run_label, curve_from_dict
+
+from ir.risk.pfe_swap import pfe_profile_swap
+from ir.risk.hw2f_sim import HW2FCurveSim
+from ir.pricers.hw1f_pricer import HullWhitePricer
+from ir.pricers.hw2f_pricer import HullWhite2FPricer
+
+st.markdown("# PFE Swap")
+st.caption("Calcule PFE/EPE pour un swap vanilla, en réutilisant un run (session ou DB) sans recalibrer.")
+
+# -------------------------
+# Source selection
+# -------------------------
+st.subheader("Run source")
+
+src = st.radio(
+    "Choix des paramètres modèle/courbe",
+    ["Session (last calibration)", "Database (saved runs)"],
+    horizontal=True,
+)
+
+selected_run = None
+run_model = None
+run_params = None
+run_curve = None
+
+if src.startswith("Session"):
+    last_run = st.session_state.get("last_run", None)
+    if last_run is None:
+        st.warning("Aucun `last_run` en session. Va d’abord sur Calibration HW1F/HW2F (pages 2/3) ou charge un run DB.", icon="⚠️")
+    else:
+        selected_run = last_run
+        run_model = last_run.get("model")
+        run_params = last_run.get("params")
+        run_curve = None  # en session tu as déjà curve via pricer, sinon via snapshot si présent
+        st.info(f"Run session détecté: model={run_model}, source={last_run.get('source_file')}", icon="🧠")
+
+else:
+    runs = list_runs(limit=200)
+    if not runs:
+        st.warning("Aucun run en DB. Sauvegarde un run depuis Calibration HW1F/HW2F.", icon="⚠️")
+    else:
+        options = {format_run_label(r): r["id"] for r in runs}
+        label = st.selectbox("Sélectionne un run", list(options.keys()))
+        rid = int(options[label])
+        db_run = get_run(rid)
+        if db_run is None:
+            st.error("Run introuvable en DB (id invalide).")
+        else:
+            if not db_run.get("curve") or not db_run.get("params"):
+                st.error("Run DB incomplet: il manque `curve` ou `params`. Re-sauvegarde un run avec la version patchée.")
+            else:
+                selected_run = db_run
+                run_model = db_run.get("model")
+                run_params = db_run.get("params")
+                run_curve = curve_from_dict(db_run.get("curve"))
+                st.success(f"Run DB chargé ✅  (id={rid}, model={run_model})", icon="✅")
+
+st.divider()
+
+# -------------------------
+# Swap + MC inputs
+# -------------------------
+st.subheader("Swap inputs")
+
+col1, col2, col3, col4 = st.columns(4)
+
+with col1:
+    q = st.slider("Quantile q", min_value=0.90, max_value=0.995, value=0.95, step=0.005)
+    payer = st.checkbox("Payer swap", value=True)
+
+with col2:
+    notional = st.number_input("Notional", value=1_000_000.0, step=100_000.0)
+    K = st.number_input("Fixed rate K (rate units)", value=0.03, format="%.6f")
+
+with col3:
+    grid_n = st.number_input("Grid points", value=21, min_value=5, step=1)
+    tau_str = st.text_input("Tau schedule (years)", value="0.0,0.5,1.0,1.5,2.0,2.5,3.0,3.5,4.0,4.5,5.0")
+
+with col4:
+    n_paths = st.number_input("MC paths", value=20000, min_value=1000, step=1000)
+    seed = st.number_input("Seed", value=2025, step=1)
+    n_steps_1f = st.number_input("HW1F steps (Euler)", value=252, min_value=50, step=10)
+
+def _parse_tau(s: str):
+    return [float(x.strip()) for x in s.split(",") if x.strip()]
+
+Tau = _parse_tau(tau_str)
+grid = np.linspace(0.0, float(Tau[-1]), int(grid_n))
+
+st.divider()
+
+# --- Progress UI helpers ---
+st.subheader("Run controls")
+
+colA, colB, colC = st.columns([1.0, 1.0, 1.2])
+with colA:
+    inner_progress = st.checkbox(
+        "Show detailed progress (per cashflow)",
+        value=False,
+        help="Affiche une progression plus fine (à l'intérieur de chaque point de grille). Peut être un peu plus lent côté UI.",
+    )
+with colB:
+    inner_every = st.number_input(
+        "Update frequency (cashflows)",
+        value=3,
+        min_value=1,
+        step=1,
+        help="Si le mode détaillé est activé: update toutes les N cashflows.",
+    )
+with colC:
+    show_table = st.checkbox(
+        "Show progress table",
+        value=True,
+        help="Affiche un mini tableau des derniers updates (utile pour diagnostiquer si ça bloque).",
+    )
+
+status_ph = st.empty()
+bar_ph = st.empty()
+table_ph = st.empty()
+
+def _run_with_progress(curve_sim, title: str):
+    st.session_state["pfe_progress_rows"] = []
+    prog = bar_ph.progress(0, text="Initialisation Monte Carlo...")
+
+    def progress_cb(d: dict):
+        rows = st.session_state.get("pfe_progress_rows", [])
+        rows.append(d)
+        st.session_state["pfe_progress_rows"] = rows
+
+        stage = d.get("stage", "grid")
+        pct = d.get("pct", None)
+
+        if pct is not None:
+            pct_int = int(max(0, min(100, round(100 * float(pct)))))
+            prog.progress(pct_int, text=f"{title} — {pct_int}%")
+        else:
+            prog.progress(0, text=f"{title} — ...")
+
+        if stage == "cashflows":
+            gi = d.get("grid_i", "?")
+            gn = d.get("grid_n", "?")
+            cf_i = d.get("cf_i", "?")
+            cf_n = d.get("cf_n", "?")
+            t = d.get("t", None)
+            Ti = d.get("Ti", None)
+            status_ph.markdown(
+                f"**{title} — simulation en cours**  \n"
+                f"- Grid: **{gi}/{gn}** (t={float(t):.4f})  \n"
+                f"- Cashflows: **{cf_i}/{cf_n}** (Ti={float(Ti):.4f})"
+            )
+        else:
+            gi = d.get("grid_i", "?")
+            gn = d.get("grid_n", "?")
+            t = d.get("t", None)
+            pfe_t = d.get("pfe_t", None)
+            epe_t = d.get("epe_t", None)
+            status_ph.markdown(
+                f"**{title} — grid {gi}/{gn}** (t={float(t):.4f})  \n"
+                f"- PFE={float(pfe_t):,.0f}  |  EPE={float(epe_t):,.0f}"
+            )
+
+        if show_table and rows:
+            tail = pd.DataFrame(rows).tail(25)
+            table_ph.dataframe(tail, use_container_width=True, hide_index=True, height=240)
+
+    pfe, epe = pfe_profile_swap(
+        curve_sim=curve_sim,
+        grid=grid,
+        Tau=Tau,
+        K=float(K),
+        N=float(notional),
+        payer=bool(payer),
+        q=float(q),
+        progress_cb=progress_cb,
+        inner_progress=bool(inner_progress),
+        inner_every=int(inner_every),
+    )
+    prog.progress(100, text=f"{title} — done ✅")
+    return pfe, epe
+
+
+# -------------------------
+# Build curve_sim without recalibration
+# -------------------------
+def _build_curve_sim_from_selected_run():
+    if selected_run is None:
+        return None, None
+
+    model = (run_model or "").strip()
+
+    # --- CASE 1: DB run -> run_curve already reconstructed ---
+    if run_curve is not None:
+        curve = run_curve
+    else:
+        # session fallback:
+        # if curve snapshot exists in session last_run, use it
+        snap = selected_run.get("curve", None)
+        if snap:
+            curve = curve_from_dict(snap)
+        else:
+            # or reuse curve from pricer in session_state if available
+            if model == "HW1F" and "hw1f_pricer" in st.session_state:
+                curve = st.session_state["hw1f_pricer"].curve
+            elif model == "HW2F" and "hw2f_pricer" in st.session_state:
+                curve = st.session_state["hw2f_pricer"].curve
+            else:
+                st.error("Impossible de reconstruire la courbe: ni snapshot `curve`, ni pricer en session.")
+                return None, None
+
+    params = run_params or selected_run.get("params", None)
+    if not isinstance(params, dict):
+        st.error("Paramètres modèle manquants/incohérents dans le run.")
+        return None, None
+
+    if model == "HW1F":
+        pricer = HullWhitePricer(
+            curve,
+            n_paths=int(n_paths),
+            n_steps=int(n_steps_1f),
+            seed=int(seed),
+            hw_params=params,
+        )
+        # curve_sim is HullWhiteCurveBuilder
+        return pricer.curve_sim, {"curve": curve, "model": "HW1F", "params": pricer.model.parameters}
+
+    if model == "HW2F":
+        pricer2 = HullWhite2FPricer(curve, hw2f_params=params)
+        curve_sim_2f = HW2FCurveSim(
+            curve=curve,
+            model=pricer2.model,
+            n_paths=int(n_paths),
+            seed=int(seed),
+            use_legacy_global_seed=True,
+        )
+        return curve_sim_2f, {"curve": curve, "model": "HW2F", "params": pricer2.model.parameters}
+
+    st.error(f"Model inconnu dans le run: {model!r}")
+    return None, None
+
+
+# -------------------------
+# Run button
+# -------------------------
+do_run = st.button("🚀 Run PFE (no recalibration)", type="primary", use_container_width=True)
+
+if do_run:
+    curve_sim, info = _build_curve_sim_from_selected_run()
+    if curve_sim is None:
+        st.stop()
+
+    st.subheader("Run info")
+    st.json(
+        {
+            "model": info["model"],
+            "params": info["params"],
+            "mc": {"n_paths": int(n_paths), "seed": int(seed), "n_steps_1f": int(n_steps_1f)},
+            "swap": {"payer": bool(payer), "N": float(notional), "K": float(K), "Tau": Tau},
+            "grid_n": int(grid_n),
+            "q": float(q),
+        }
+    )
+
+    with st.spinner("PFE en cours..."):
+        title = f"{info['model']} | PFE swap"
+        pfe, epe = _run_with_progress(curve_sim, title=title)
+
+    st.success("Terminé ✅", icon="✅")
+
+    st.subheader("Results")
+    df_out = pd.DataFrame({"t": grid, "PFE": pfe, "EPE": epe})
+    st.dataframe(df_out, use_container_width=True, height=260)
+
+    st.pyplot(fig_pfe(grid, pfe, epe=epe, q=float(q), title=title), clear_figure=True)
+
+    st.download_button(
+        "⬇️ Download results (CSV)",
+        data=df_out.to_csv(index=False).encode("utf-8"),
+        file_name="pfe_swap.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+
+### FILE: streamlit_app\pages\5_Portfolio_Tracking.py
+from __future__ import annotations
+
+import pandas as pd
+import streamlit as st
+
+from streamlit_app.ui.db import list_runs, save_run, get_run, delete_run
+
+st.markdown("# Portfolio Tracking")
+st.caption("Historique des calibrations/PFE (local SQLite). Comparaison simple et export.")
+
+last_run = st.session_state.get("last_run", None)
+last_pfe = st.session_state.get("last_pfe", None)
+
+colA, colB = st.columns([1.0, 1.2], gap="large")
+
+with colA:
+    st.subheader("Save current session run")
+    if last_run is None:
+        st.info("Aucun run en session (calibre d’abord HW1F/HW2F).", icon="ℹ️")
+    else:
+        default_label = f"{last_run['model']} | {last_run.get('source_file','')}"
+        label = st.text_input("Label", value=default_label)
+        notes = st.text_area("Notes", value="", height=120)
+
+        artifacts = dict(last_run.get("artifacts", {}) or {})
+        if last_pfe is not None:
+            artifacts["pfe"] = last_pfe
+
+        # IMPORTANT: curve snapshot (sinon la DB ne peut pas stocker correctement un run)
+        curve_snapshot = last_run.get("curve_snapshot", None) or st.session_state.get("last_curve_snapshot", None)
+
+        if st.button("💾 Save run", type="primary", use_container_width=True):
+            if curve_snapshot is None:
+                st.error(
+                    "Impossible de sauver : curve_snapshot absent. "
+                    "Relance une calibration (HW1F/HW2F) après avoir appliqué le patch.",
+                    icon="⚠️",
+                )
+            else:
+                run_id = save_run(
+                    label=label,
+                    model=last_run["model"],
+                    source_file=last_run.get("source_file"),
+                    rmsre=last_run.get("rmsre"),
+                    curve_snapshot=curve_snapshot,
+                    params=last_run.get("params", {}),
+                    artifacts=artifacts,
+                    notes=notes,
+                    meta={},  # extensible
+                )
+                st.success(f"Saved ✅ (id={run_id})", icon="✅")
+                st.rerun()
+
+with colB:
+    st.subheader("Runs history")
+
+    runs = list_runs()
+    df = pd.DataFrame(runs)
+    st.dataframe(df, use_container_width=True, height=260)
+
+    if df.empty:
+        st.stop()
+
+    ids = df["id"].astype(int).tolist()
+    pick1 = st.selectbox("Select run A", ids, index=0)
+    pick2 = st.selectbox("Select run B (optional)", [None] + ids, index=0)
+
+    runA = get_run(int(pick1))
+    st.markdown("### Run A")
+    st.json({k: runA.get(k) for k in ["id", "created_at", "label", "model", "source_file", "rmsre"]})
+    st.json(runA.get("params", {}))
+
+    if pick2 is not None:
+        runB = get_run(int(pick2))
+        st.markdown("### Run B")
+        st.json({k: runB.get(k) for k in ["id", "created_at", "label", "model", "source_file", "rmsre"]})
+        st.json(runB.get("params", {}))
+
+        st.markdown("### Diff (params)")
+        keys = sorted(set(runA.get("params", {}).keys()) | set(runB.get("params", {}).keys()))
+        rows = []
+        for k in keys:
+            a = runA.get("params", {}).get(k, None)
+            b = runB.get("params", {}).get(k, None)
+            rows.append({"param": k, "A": a, "B": b})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, height=260)
+
+    st.divider()
+    if st.button("🗑️ Delete run A"):
+        delete_run(int(pick1))
+        st.warning("Deleted run A.", icon="🗑️")
+        st.rerun()
+
+
+### FILE: streamlit_app\pages\6_Documentation.py
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import streamlit as st
+
+from streamlit_app.ui.code_docs import render_doc_panel, load_docs_registry
+
+ROOT = Path(__file__).resolve().parents[2]
+
+# What we consider "text-like" to preview nicely (no external deps)
+TEXT_EXTS = {
+    ".py": "python",
+    ".ipynb": "ipynb",
+    ".md": "markdown",
+    ".txt": "text",
+    ".json": "json",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".toml": "toml",
+    ".ini": "ini",
+    ".cfg": "ini",
+}
+
+MAX_PREVIEW_BYTES = 1_200_000  # ~1.2MB
+
+# UI options (no sidebar anymore)
+SHOW_META = True
+WRAP_LINES = False  # set True if you prefer wrapping (best effort)
+
+
+def _fmt_bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n/1024:.1f} KB"
+    return f"{n/(1024*1024):.2f} MB"
+
+
+def _fmt_dt(ts: float) -> str:
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _read_text_safely(path: Path, max_bytes: int = MAX_PREVIEW_BYTES) -> Tuple[str, bool]:
+    """
+    Returns (text, truncated).
+    Decodes as UTF-8 with replacement; truncates by bytes if too large.
+    """
+    b = path.read_bytes()
+    truncated = False
+    if len(b) > max_bytes:
+        b = b[:max_bytes]
+        truncated = True
+    text = b.decode("utf-8", errors="replace")
+    return text, truncated
+
+
+def _render_notebook(path: Path) -> None:
+    """
+    Render a .ipynb as markdown + code cells (simple, robust).
+    """
+    raw, truncated = _read_text_safely(path)
+    if truncated:
+        st.warning(
+            f"Notebook trop volumineux : preview tronquée à {_fmt_bytes(MAX_PREVIEW_BYTES)}. "
+            "Tu peux le télécharger pour l’ouvrir complet.",
+            icon="⚠️",
+        )
+
+    try:
+        nb = json.loads(raw)
+    except Exception:
+        st.error("Impossible de parser ce .ipynb (JSON invalide).", icon="❌")
+        st.code(raw, language="json")
+        return
+
+    cells = nb.get("cells", [])
+    if not isinstance(cells, list):
+        st.error("Format .ipynb inattendu (cells manquant).", icon="❌")
+        st.code(raw, language="json")
+        return
+
+    show_outputs = st.checkbox("Afficher outputs", value=False)
+    st.divider()
+
+    for i, cell in enumerate(cells, start=1):
+        cell_type = cell.get("cell_type", "")
+        src = cell.get("source", "")
+
+        if isinstance(src, list):
+            src_text = "".join(src)
+        else:
+            src_text = str(src)
+
+        if cell_type == "markdown":
+            if src_text.strip():
+                st.markdown(src_text)
+        elif cell_type == "code":
+            st.markdown(f"**In [{i}]**")
+            st.code(src_text, language="python")
+
+            if show_outputs:
+                outs = cell.get("outputs", [])
+                if isinstance(outs, list) and outs:
+                    for out in outs:
+                        otype = out.get("output_type", "")
+                        if otype == "stream":
+                            txt = out.get("text", "")
+                            if isinstance(txt, list):
+                                txt = "".join(txt)
+                            st.code(str(txt), language="text")
+                        elif otype in ("execute_result", "display_data"):
+                            data = out.get("data", {})
+                            txt = None
+                            if isinstance(data, dict):
+                                txt = data.get("text/plain", None)
+                            if txt is not None:
+                                if isinstance(txt, list):
+                                    txt = "".join(txt)
+                                st.code(str(txt), language="text")
+                        elif otype == "error":
+                            tb = out.get("traceback", [])
+                            if isinstance(tb, list):
+                                st.code("\n".join(tb), language="text")
+        else:
+            continue
+
+
+def _language_for(path: Path) -> str:
+    ext = path.suffix.lower()
+    if ext == ".ipynb":
+        return "json"
+    return TEXT_EXTS.get(ext, "text")
+
+
+def _meta_for_rel(rel: str) -> Optional[Dict]:
+    """
+    Build metadata for a file relpath (from ROOT), or None if not usable.
+    """
+    p = ROOT / rel
+    if not p.exists() or not p.is_file():
+        return None
+
+    ext = p.suffix.lower()
+    if ext not in TEXT_EXTS:
+        return None
+
+    try:
+        stt = p.stat()
+        size = int(stt.st_size)
+        mtime = float(stt.st_mtime)
+    except OSError:
+        return None
+
+    # lightweight line count (best effort, only for small-ish files)
+    n_lines: Optional[int] = None
+    if ext != ".ipynb" and size <= 400_000:
+        try:
+            txt = p.read_text(encoding="utf-8", errors="ignore")
+            n_lines = txt.count("\n") + 1 if txt else 0
+        except Exception:
+            n_lines = None
+
+    return {
+        "rel": rel,
+        "path": str(p),
+        "ext": ext,
+        "size": size,
+        "mtime": mtime,
+        "lines": n_lines,
+    }
+
+
+# -----------------------------
+# UI
+# -----------------------------
+st.markdown("# Documentation")
+st.caption("Affiche la documentation des fichiers principaux du projet.")
+
+# Load registry and build file list from registry keys only
+registry = load_docs_registry()
+registry_rels = sorted([k for k in registry.keys() if isinstance(k, str) and k.strip()])
+
+if not registry_rels:
+    st.error("docs_registry.json est vide (aucun fichier référencé).", icon="❌")
+    st.stop()
+
+all_files: List[Dict] = []
+missing: List[str] = []
+skipped: List[str] = []
+
+for rel in registry_rels:
+    m = _meta_for_rel(rel)
+    if m is None:
+        p = ROOT / rel
+        if not p.exists():
+            missing.append(rel)
+        else:
+            skipped.append(rel)
+        continue
+    all_files.append(m)
+
+if missing:
+    st.warning(
+        "Certains fichiers sont référencés dans docs_registry.json mais introuvables sur disque :\n"
+        + "\n".join([f"- {x}" for x in missing]),
+        icon="⚠️",
+    )
+
+if skipped:
+    st.info(
+        "Certains fichiers référencés sont ignorés (extension non supportée pour preview) :\n"
+        + "\n".join([f"- {x}" for x in skipped]),
+        icon="ℹ️",
+    )
+
+if not all_files:
+    st.error("Aucun fichier affichable (tous manquants ou ignorés).", icon="❌")
+    st.stop()
+
+rels = [d["rel"] for d in all_files]
+
+# Selection state + navigation
+if "px_choice" not in st.session_state:
+    st.session_state["px_choice"] = rels[0]
+if st.session_state["px_choice"] not in rels:
+    st.session_state["px_choice"] = rels[0]
+
+nav1, nav2, nav3, nav4 = st.columns([0.18, 0.18, 1.0, 0.28], gap="small")
+with nav1:
+    if st.button("⬅️ Prev", use_container_width=True):
+        i = rels.index(st.session_state["px_choice"])
+        st.session_state["px_choice"] = rels[max(0, i - 1)]
+with nav2:
+    if st.button("Next ➡️", use_container_width=True):
+        i = rels.index(st.session_state["px_choice"])
+        st.session_state["px_choice"] = rels[min(len(rels) - 1, i + 1)]
+with nav4:
+    st.caption(f"{rels.index(st.session_state['px_choice']) + 1} / {len(rels)}")
+
+choice = st.selectbox(
+    "Select file",
+    rels,
+    index=rels.index(st.session_state["px_choice"]),
+)
+st.session_state["px_choice"] = choice
+
+path = ROOT / choice
+meta = next(d for d in all_files if d["rel"] == choice)
+
+# Header + actions
+st.write(f"**{choice}**")
+if SHOW_META:
+    st.caption(
+        f"Ext: `{meta['ext']}`  |  Size: {_fmt_bytes(meta['size'])}  |  "
+        f"Modified: {_fmt_dt(meta['mtime'])}"
+        + (f"  |  Lines: {meta['lines']}" if meta.get("lines") is not None else "")
+    )
+
+# Download button
+try:
+    file_bytes = path.read_bytes()
+    st.download_button(
+        "⬇️ Download file",
+        data=file_bytes,
+        file_name=path.name,
+        mime="text/plain",
+        use_container_width=False,
+    )
+except Exception:
+    st.warning("Impossible de préparer le téléchargement (droits/IO).", icon="⚠️")
+
+# Preview + doc (always on)
+ext = path.suffix.lower()
+left, right = st.columns([1.35, 0.85], gap="large")
+
+with left:
+    st.subheader("Preview")
+
+    if ext == ".ipynb":
+        view_mode = st.radio("Notebook view", ["Rendered", "Raw JSON"], horizontal=True, index=0)
+        if view_mode == "Rendered":
+            _render_notebook(path)
+        else:
+            raw, truncated = _read_text_safely(path)
+            if truncated:
+                st.warning(
+                    f"Preview tronquée à {_fmt_bytes(MAX_PREVIEW_BYTES)} (notebook trop volumineux).",
+                    icon="⚠️",
+                )
+            st.code(raw, language="json")
+    else:
+        try:
+            content, truncated = _read_text_safely(path)
+            if truncated:
+                st.warning(
+                    f"Preview tronquée à {_fmt_bytes(MAX_PREVIEW_BYTES)} (fichier volumineux).",
+                    icon="⚠️",
+                )
+
+            lang = _language_for(path)
+            # wrap is "best effort" (Streamlit st.code doesn't provide a true toggle)
+            if WRAP_LINES:
+                st.code(content, language=lang)
+            else:
+                st.code(content, language=lang)
+        except Exception as e:
+            st.error(f"Erreur de lecture : {e}", icon="❌")
+
+with right:
+    render_doc_panel(choice, path)
+
+
+### FILE: streamlit_app\ui\capture.py
+from __future__ import annotations
+
+from contextlib import redirect_stdout
+from io import StringIO
+
+def capture_stdout(fn, *args, **kwargs) -> tuple[object, str]:
+    buf = StringIO()
+    with redirect_stdout(buf):
+        out = fn(*args, **kwargs)
+    return out, buf.getvalue()
+
+
+### FILE: streamlit_app\ui\code_docs.py
+# streamlit_app/ui/code_docs.py
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import streamlit as st
+
+# We keep it here so both Project Explorer + other pages can reuse it
+ROOT = Path(__file__).resolve().parents[2]
+REGISTRY_PATH = ROOT / "streamlit_app" / "data" / "docs_registry.json"
+
+
+def load_docs_registry() -> Dict[str, Any]:
+    """
+    Loads manual docs registry (JSON) keyed by file relpath.
+    Cached because Streamlit reruns a lot.
+    """
+    @st.cache_data(show_spinner=False)
+    def _load(p: str) -> Dict[str, Any]:
+        path = Path(p)
+        if not path.exists():
+            return {}
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+
+    return _load(str(REGISTRY_PATH))
+
+
+def manual_doc_for(relpath: str) -> Optional[Dict[str, Any]]:
+    reg = load_docs_registry()
+    d = reg.get(relpath, None)
+    if isinstance(d, dict):
+        return d
+    return None
+
+
+def render_doc_panel(relpath: str, path: Path) -> None:
+    """
+    Right-hand panel: manual docs only (Résumé).
+    """
+    st.subheader("Documentation")
+
+    manual = manual_doc_for(relpath)
+
+    if manual is None:
+        st.info(
+            "Pas de fiche manuelle pour ce fichier. (Ajoute une entrée dans docs_registry.json)",
+            icon="ℹ️",
+        )
+        return
+
+    title = manual.get("title", relpath)
+    tags = manual.get("tags", [])
+    summary = manual.get("summary", "")
+    usage = manual.get("usage", "")
+    notes = manual.get("notes", "")
+
+    st.markdown(f"### {title}")
+    if tags:
+        st.caption(" • ".join([f"`{t}`" for t in tags]))
+
+    if summary:
+        st.markdown(summary)
+
+    if usage:
+        st.markdown("#### Usage")
+        st.markdown(usage)
+
+    if notes:
+        st.markdown("#### Notes")
+        st.markdown(notes)
+
+
+### FILE: streamlit_app\ui\db.py
+# streamlit_app/ui/db.py
+from __future__ import annotations
+
+import json
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+import streamlit as st
+
+# Project root: .../streamlit_app/ui/db.py -> parents[2] = project root
+ROOT = Path(__file__).resolve().parents[2]
+DATA_DIR = ROOT / "streamlit_app" / "data"
+DB_PATH = DATA_DIR / "irlab.db"
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _connect() -> sqlite3.Connection:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    rows = cur.fetchall()
+    return {str(r["name"]) for r in rows}
+
+
+def init_db() -> None:
+    conn = _connect()
+    cur = conn.cursor()
+
+    # Base table (new installs)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            label TEXT,
+            model TEXT NOT NULL,                 -- "HW1F" / "HW2F"
+            source_file TEXT,                    -- original uploaded filename (informational)
+            rmsre REAL,
+            curve_json TEXT NOT NULL,            -- serialized Curve snapshot
+            params_json TEXT NOT NULL,           -- serialized model parameters
+            artifacts_json TEXT,                 -- optional: PFE, etc.
+            notes TEXT,                          -- optional: user notes
+            meta_json TEXT                        -- optional: extra metadata
+        )
+        """
+    )
+
+    # Soft migrations for existing DBs created with an older schema
+    cols = _table_columns(conn, "runs")
+
+    def _add_col(name: str, ddl: str):
+        if name not in cols:
+            cur.execute(f"ALTER TABLE runs ADD COLUMN {ddl}")
+
+    _add_col("label", "label TEXT")
+    _add_col("artifacts_json", "artifacts_json TEXT")
+    _add_col("notes", "notes TEXT")
+    _add_col("meta_json", "meta_json TEXT")
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_runs_model ON runs(model)")
+    conn.commit()
+    conn.close()
+
+
+# -------------------------
+# Curve serialization helpers
+# -------------------------
+
+def curve_to_dict(curve) -> dict:
+    """
+    Minimal snapshot needed to reconstruct ir.market.curve.Curve.
+    Assumes curve has attributes: time, discount_factors, smooth.
+    """
+    return {
+        "time": [float(x) for x in getattr(curve, "time")],
+        "discount_factors": [float(x) for x in getattr(curve, "discount_factors")],
+        "smooth": float(getattr(curve, "smooth", 1e-7)),
+    }
+
+
+def curve_from_dict(d: dict):
+    from ir.market.curve import Curve  # local import to avoid early import issues
+
+    time = d.get("time", None)
+    disc = d.get("discount_factors", None)
+    smooth = d.get("smooth", 1e-7)
+
+    if time is None or disc is None:
+        raise ValueError("Invalid curve snapshot: missing 'time' or 'discount_factors'.")
+
+    return Curve(time, disc, smooth=float(smooth))
+
+
+# -------------------------
+# Cache helpers
+# -------------------------
+
+def _clear_runs_cache() -> None:
+    try:
+        list_runs.clear()  # type: ignore[attr-defined]
+    except Exception:
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+
+
+# -------------------------
+# Runs API
+# -------------------------
+
+def save_run(
+    *,
+    model: str,
+    curve_snapshot: dict,
+    params: dict,
+    source_file: Optional[str] = None,
+    rmsre: Optional[float] = None,
+    # New optional fields (for Portfolio Tracking UI)
+    label: Optional[str] = None,
+    artifacts: Optional[dict] = None,
+    notes: Optional[str] = None,
+    meta: Optional[dict] = None,
+) -> int:
+    """
+    Insert a run in DB and return its id.
+
+    Backward compatible:
+    - label/artifacts/notes are optional (stored in columns if present, and also in meta_json).
+    """
+    model = str(model).strip()
+    if model not in ("HW1F", "HW2F"):
+        raise ValueError("model must be 'HW1F' or 'HW2F'.")
+
+    if curve_snapshot is None:
+        raise ValueError("curve_snapshot is required (run a calibration first, or ensure last_curve_snapshot is set).")
+
+    created_at = _utc_now_iso()
+
+    curve_json = json.dumps(curve_snapshot, ensure_ascii=False)
+    params_json = json.dumps(params or {}, ensure_ascii=False)
+    artifacts_json = json.dumps(artifacts or {}, ensure_ascii=False)
+    notes_txt = "" if notes is None else str(notes)
+
+    # merge meta
+    meta_out = dict(meta or {})
+    if label is not None:
+        meta_out.setdefault("label", str(label))
+    if artifacts is not None:
+        meta_out.setdefault("artifacts", artifacts)
+    if notes is not None:
+        meta_out.setdefault("notes", notes_txt)
+    meta_json = json.dumps(meta_out, ensure_ascii=False)
+
+    conn = _connect()
+    cols = _table_columns(conn, "runs")
+    cur = conn.cursor()
+
+    ins_cols = ["created_at", "model", "source_file", "rmsre", "curve_json", "params_json"]
+    ins_vals = [created_at, model, source_file, rmsre, curve_json, params_json]
+
+    if "label" in cols:
+        ins_cols.append("label")
+        ins_vals.append(label)
+    if "artifacts_json" in cols:
+        ins_cols.append("artifacts_json")
+        ins_vals.append(artifacts_json)
+    if "notes" in cols:
+        ins_cols.append("notes")
+        ins_vals.append(notes_txt)
+    if "meta_json" in cols:
+        ins_cols.append("meta_json")
+        ins_vals.append(meta_json)
+
+    placeholders = ",".join(["?"] * len(ins_cols))
+    colnames = ",".join(ins_cols)
+
+    cur.execute(
+        f"""
+        INSERT INTO runs({colnames})
+        VALUES ({placeholders})
+        """,
+        tuple(ins_vals),
+    )
+    conn.commit()
+    run_id = int(cur.lastrowid)
+    conn.close()
+
+    _clear_runs_cache()
+    return run_id
+
+
+@st.cache_data(show_spinner=False)
+def list_runs(limit: int = 200) -> list[dict]:
+    """
+    Return a list of runs (latest first), already parsed from JSON.
+    """
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT *
+        FROM runs
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    out: list[dict] = []
+    for r in rows:
+        meta = {}
+        try:
+            meta = json.loads(r["meta_json"]) if ("meta_json" in r.keys() and r["meta_json"]) else {}
+        except Exception:
+            meta = {}
+
+        label = None
+        if "label" in r.keys():
+            label = r["label"]
+        if not label:
+            label = meta.get("label", None)
+
+        artifacts = {}
+        if "artifacts_json" in r.keys() and r["artifacts_json"]:
+            try:
+                artifacts = json.loads(r["artifacts_json"])
+            except Exception:
+                artifacts = {}
+        else:
+            artifacts = meta.get("artifacts", {}) or {}
+
+        notes = ""
+        if "notes" in r.keys() and r["notes"]:
+            notes = str(r["notes"])
+        else:
+            notes = str(meta.get("notes", ""))
+
+        out.append(
+            {
+                "id": int(r["id"]),
+                "created_at": str(r["created_at"]),
+                "label": label,
+                "model": str(r["model"]),
+                "source_file": r["source_file"],
+                "rmsre": r["rmsre"],
+                "curve": json.loads(r["curve_json"]) if r["curve_json"] else None,
+                "params": json.loads(r["params_json"]) if r["params_json"] else {},
+                "artifacts": artifacts,
+                "notes": notes,
+                "meta": meta,
+            }
+        )
+    return out
+
+
+def get_run(run_id: int) -> Optional[dict]:
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM runs WHERE id = ?", (int(run_id),))
+    r = cur.fetchone()
+    conn.close()
+
+    if r is None:
+        return None
+
+    meta = {}
+    try:
+        meta = json.loads(r["meta_json"]) if ("meta_json" in r.keys() and r["meta_json"]) else {}
+    except Exception:
+        meta = {}
+
+    label = None
+    if "label" in r.keys():
+        label = r["label"]
+    if not label:
+        label = meta.get("label", None)
+
+    artifacts = {}
+    if "artifacts_json" in r.keys() and r["artifacts_json"]:
+        try:
+            artifacts = json.loads(r["artifacts_json"])
+        except Exception:
+            artifacts = {}
+    else:
+        artifacts = meta.get("artifacts", {}) or {}
+
+    notes = ""
+    if "notes" in r.keys() and r["notes"]:
+        notes = str(r["notes"])
+    else:
+        notes = str(meta.get("notes", ""))
+
+    return {
+        "id": int(r["id"]),
+        "created_at": str(r["created_at"]),
+        "label": label,
+        "model": str(r["model"]),
+        "source_file": r["source_file"],
+        "rmsre": r["rmsre"],
+        "curve": json.loads(r["curve_json"]) if r["curve_json"] else None,
+        "params": json.loads(r["params_json"]) if r["params_json"] else {},
+        "artifacts": artifacts,
+        "notes": notes,
+        "meta": meta,
+    }
+
+
+def delete_run(run_id: int) -> bool:
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM runs WHERE id = ?", (int(run_id),))
+    conn.commit()
+    deleted = (cur.rowcount or 0) > 0
+    conn.close()
+
+    _clear_runs_cache()
+    return deleted
+
+
+def format_run_label(run: dict) -> str:
+    rid = run.get("id", "?")
+    ts = run.get("created_at", "")
+    model = run.get("model", "?")
+    src = run.get("source_file") or "unknown"
+    label = run.get("label", None)
+    rmsre = run.get("rmsre", None)
+
+    head = f"#{rid} | {model} | {ts}"
+    if label:
+        head += f" | {label}"
+    if rmsre is not None:
+        head += f" | RMSRE={float(rmsre):.2e}"
+    head += f" | {src}"
+    return head
+
+
+### FILE: streamlit_app\ui\io.py
+from __future__ import annotations
+
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+import streamlit as st
+
+from ir.market.loaders_excel import load_curve_xlsx, load_swaption_template_xlsx, load_caplet_template_xlsx
+
+
+@dataclass
+class UploadedXlsx:
+    name: str
+    path: str
+
+@st.cache_data(show_spinner=False)
+def _write_tmp_xlsx(file_bytes: bytes, filename: str) -> UploadedXlsx:
+    suffix = Path(filename).suffix if filename else ".xlsx"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(file_bytes)
+        tmp.flush()
+        return UploadedXlsx(name=filename, path=tmp.name)
+
+def load_curve_and_swaption_from_upload(
+    uploaded,
+    *,
+    curve_sheet: str = "Curve",
+    template_sheet: str = "Template",
+    smooth: float = 1e-7,
+):
+    file_bytes = uploaded.getvalue()
+    tmp = _write_tmp_xlsx(file_bytes, uploaded.name)
+
+    curve = load_curve_xlsx(tmp.path, sheet=curve_sheet, smooth=smooth)
+    swpn = load_swaption_template_xlsx(tmp.path, sheet=template_sheet)
+    return tmp.name, curve, swpn
+
+def load_curve_only_from_upload(uploaded, *, curve_sheet: str = "Curve", smooth: float = 1e-7):
+    file_bytes = uploaded.getvalue()
+    tmp = _write_tmp_xlsx(file_bytes, uploaded.name)
+    curve = load_curve_xlsx(tmp.path, sheet=curve_sheet, smooth=smooth)
+    return tmp.name, curve
+
+def load_caplet_template_from_upload(uploaded, *, sheet: str = "Template"):
+    file_bytes = uploaded.getvalue()
+    tmp = _write_tmp_xlsx(file_bytes, uploaded.name)
+    caplets = load_caplet_template_xlsx(tmp.path, sheet=sheet)
+    return tmp.name, caplets
+
+
+### FILE: streamlit_app\ui\plotting.py
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+
+
+def _human_money(x, pos=None) -> str:
+    x = float(x)
+    ax = abs(x)
+    if ax >= 1e9:
+        return f"{x/1e9:.1f}B"
+    if ax >= 1e6:
+        return f"{x/1e6:.1f}M"
+    if ax >= 1e3:
+        return f"{x/1e3:.1f}k"
+    return f"{x:.0f}"
+
+
+def fig_curve(curve, t_max: float = 30.0, n: int = 300, title_prefix: str = "Market"):
+    t = np.linspace(0.01, float(t_max), int(n))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    axes[0].plot(t, curve.discount(t), linewidth=2)
+    axes[0].set_title(f"{title_prefix} Discount Curve", fontsize=13, fontweight="bold")
+    axes[0].set_xlabel("Time (Years)")
+    axes[0].set_ylabel("Discount Factor")
+    axes[0].grid(alpha=0.25)
+
+    axes[1].plot(t, curve.inst_forward_rate(t), linewidth=2)
+    axes[1].set_title(f"{title_prefix} Instantaneous Forward Rate", fontsize=13, fontweight="bold")
+    axes[1].set_xlabel("Time (Years)")
+    axes[1].set_ylabel("Rate")
+    axes[1].grid(alpha=0.25)
+
+    plt.tight_layout()
+    return fig
+
+
+def fig_prices_by_tenor(
+    df: pd.DataFrame,
+    *,
+    tenors=(5.0, 10.0, 20.0, 30.0),
+    tenor_col="Tenor",
+    x_col="Expiry",
+    mkt_col="Price",
+    model_col="Model_Price",
+    ylabel="Forward Premium",
+    title="Swaption Price Term Structure",
+):
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    axes = axes.flatten()
+
+    for idx, tenor in enumerate(tenors):
+        ax = axes[idx]
+        dft = df[df[tenor_col] == tenor].copy()
+        if len(dft) == 0:
+            ax.set_axis_off()
+            continue
+        dft = dft.sort_values(x_col)
+
+        ax.plot(dft[x_col], dft[mkt_col], linewidth=2, label="Market")
+        ax.plot(dft[x_col], dft[model_col], linestyle="--", linewidth=2, label="Model")
+        ax.set_title(f"{title} (ATM, {int(tenor)}Y)", fontsize=12, fontweight="bold")
+        ax.set_xlabel("Expiry (Years)")
+        ax.set_ylabel(ylabel)
+        ax.grid(alpha=0.25)
+        ax.legend()
+
+    plt.tight_layout()
+    return fig
+
+
+def fig_vols_by_tenor(
+    df: pd.DataFrame,
+    *,
+    tenors=(5.0, 10.0, 20.0, 30.0),
+    tenor_col="Tenor",
+    x_col="Expiry",
+    mkt_col="Market_Vol (Bps)",
+    model_col="Model_Vol (Bps)",
+    ylabel="Normal Vol (Bps)",
+    title="Swaption Normal Vol Term Structure",
+):
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    axes = axes.flatten()
+
+    for idx, tenor in enumerate(tenors):
+        ax = axes[idx]
+        dft = df[df[tenor_col] == tenor].copy()
+        if len(dft) == 0:
+            ax.set_axis_off()
+            continue
+        dft = dft.sort_values(x_col)
+
+        ax.plot(dft[x_col], dft[mkt_col], linewidth=2, label="Market")
+        ax.plot(dft[x_col], dft[model_col], linestyle="--", linewidth=2, label="Model")
+        ax.set_title(f"{title} (ATM, {int(tenor)}Y)", fontsize=12, fontweight="bold")
+        ax.set_xlabel("Expiry (Years)")
+        ax.set_ylabel(ylabel)
+        ax.grid(alpha=0.25)
+        ax.legend()
+
+    plt.tight_layout()
+    return fig
+
+
+def fig_pfe(grid, pfe, epe=None, q: float = 0.95, title: str = "PFE profile", subtitle: str | None = None):
+    grid = np.asarray(grid, dtype=float)
+    pfe = np.asarray(pfe, dtype=float)
+    epe = None if epe is None else np.asarray(epe, dtype=float)
+
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+    ax.plot(grid, pfe, marker="o", markersize=3.5, linewidth=2.0, label=f"PFE ({int(q*100)}%)")
+    ax.fill_between(grid, 0.0, pfe, alpha=0.12)
+
+    if epe is not None:
+        ax.plot(grid, epe, marker="s", markersize=3.2, linewidth=1.8, linestyle="--", label="EPE")
+
+    ax.set_title(title, fontsize=14, fontweight="bold", pad=10)
+    if subtitle:
+        ax.text(0.0, 1.02, subtitle, transform=ax.transAxes, fontsize=10, alpha=0.9, va="bottom")
+
+    ax.set_xlabel("Time (years)")
+    ax.set_ylabel("Exposure")
+    ax.yaxis.set_major_formatter(FuncFormatter(_human_money))
+    ax.grid(alpha=0.25)
+    ax.set_xlim(grid.min(), grid.max())
+    ax.set_ylim(bottom=0.0)
+    ax.legend(loc="upper right")
+
+    plt.tight_layout()
+    return fig
+
+
+### FILE: streamlit_app\ui\__init__.py
+
+
