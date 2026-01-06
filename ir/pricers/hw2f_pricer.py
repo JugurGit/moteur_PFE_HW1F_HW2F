@@ -6,41 +6,80 @@ from ir.models.hw2f import HullWhite2FModel
 
 class HullWhite2FPricer:
     """
-    Pricing engine for caplets and swaptions under Hull-White 2F (G2++):
+    Moteur de pricing pour caplets et swaptions sous Hull–White 2 facteurs (G2++).
 
-    - Caplet pricing: via ZC bond put using closed-form bond option variance v^2(T,S)
-    - Swaption pricing: via Gaussian swap-rate approximation and Bachelier pricing
+    Fonctionnalités
+    ---------------
+    - Caplet : via put sur ZC bond avec variance fermée v^2(T,S) (formule d'option sur bond).
+    - Swaption : via approximation gaussienne du swap-rate (poids figés) + pricing Bachelier (normal).
 
     Notes
     -----
-    - Single-curve setup: discounting and forwarding from the same curve.
-    - Accruals are approximated as Delta = Tau[i] - Tau[i-1] (same convention as your 1F pricer).
+    - Hypothèse single-curve : discounting et forwarding via la même courbe.
+    - Accruals : Delta_i ≈ Tau[i] - Tau[i-1] (même convention que ton pricer 1F).
     """
 
     def __init__(self, curve, hw2f_params=None):
+        """
+        Initialise le pricer 2F.
+
+        Paramètres
+        ----------
+        curve : Curve
+            Courbe d’actualisation P(0,t).
+        hw2f_params : dict | None
+            Paramètres G2++ : {'a','b','rho','sigma','eta','r0'}.
+        """
         self.curve = curve
         self.model = HullWhite2FModel(curve, hw2f_params)
 
     # -------------------------
-    # Helpers (curve quantities)
+    # Helpers (quantités courbe)
     # -------------------------
 
     def discount_factor(self, t: float) -> float:
+        """
+        Raccourci : renvoie P(0,t) via le modèle/courbe.
+
+        Paramètre
+        ---------
+        t : float
+            Temps en années.
+
+        Retourne
+        --------
+        float
+            Discount factor P(0,t).
+        """
         return self.model.discount_factor(t)
 
     def _annuity_and_swap_rate_0(self, Tau):
         """
-        Compute A0 and S0 for a fixed-leg schedule Tau = [T0, T1, ..., Tn].
+        Calcule l'annuité A0 et le swap rate forward S0 à t=0 pour un schedule fixe.
 
-        A0 = sum_i Delta_i P(0,Ti)
-        S0 = (P(0,T0) - P(0,Tn)) / A0
+        Pour Tau = [T0, T1, ..., Tn] :
+          - Delta_i = Tau[i] - Tau[i-1]
+          - A0 = sum_{i=1..n} Delta_i * P(0,Ti)
+          - S0 = (P(0,T0) - P(0,Tn)) / A0
+
+        Paramètres
+        ----------
+        Tau : list[float]
+            Dates de paiement de la jambe fixe, avec T0 = start/expiry et Tn = dernière date.
+
+        Retourne
+        --------
+        (float, float)
+            (A0, S0)
+
         """
         if len(Tau) < 2:
-            raise ValueError("Tau must contain at least [T0, Tn].")
+            raise ValueError("Tau doit contenir au moins [T0, Tn].")
 
         T0 = float(Tau[0])
         Tn = float(Tau[-1])
 
+        # Annuité A0
         A0 = 0.0
         for i in range(1, len(Tau)):
             Ti = float(Tau[i])
@@ -48,23 +87,39 @@ class HullWhite2FPricer:
             A0 += delta * self.discount_factor(Ti)
 
         if A0 <= 0:
-            raise ValueError("Annuity A0 must be > 0.")
+            raise ValueError("Annuity A0 doit être > 0.")
 
+        # Swap rate forward S0
         S0 = (self.discount_factor(T0) - self.discount_factor(Tn)) / A0
         return float(A0), float(S0)
 
     def _swaption_weights_frozen(self, Tau):
         """
-        Build frozen weights c_j for dates U_j = Tau[j] in the Gaussian swap-rate approx.
+        Construit les poids figés (frozen weights) c_j pour l'approximation gaussienne du swap-rate.
 
-        We approximate:
-          dS(t) ≈ sum_j c_j * (dP(t, U_j) / P(t, U_j))  (up to deterministic loadings)
+        Idée
+        ----
+        On approxime le swap rate comme combinaison linéaire des log-bonds :
+          dS(t) ≈ sum_j c_j * (dP(t,U_j)/P(t,U_j))   (à des loadings déterministes près)
 
-        The frozen weights are:
-          c(T0) += P(0,T0)/A0
-          c(Tn) += -P(0,Tn)/A0
-          c(Ti) += -(S0/A0) * Delta_i * P(0,Ti) for i=1..n
-        (So the last date Tn has two contributions: numerator + annuity.)
+        Poids figés (à t=0), avec U_j = Tau[j] :
+          - c(T0) +=  P(0,T0) / A0
+          - c(Tn) += -P(0,Tn) / A0
+          - c(Ti) += -(S0/A0) * Delta_i * P(0,Ti)   pour i=1..n
+        (Donc Tn reçoit potentiellement deux contributions : numerator + annuity.)
+
+        Paramètres
+        ----------
+        Tau : list[float]
+            Schedule fixe [T0, T1, ..., Tn] où T0 = expiry/start.
+
+        Retourne
+        --------
+        (U, c, A0, S0)
+            U : list[float] les dates
+            c : np.ndarray les poids figés 
+            A0 : float annuité
+            S0 : float swap rate forward
         """
         A0, S0 = self._annuity_and_swap_rate_0(Tau)
 
@@ -72,11 +127,11 @@ class HullWhite2FPricer:
         m = len(U)
         c = np.zeros(m, dtype=float)
 
-        # Numerator contributions: +P(0,T0)/A0 and -P(0,Tn)/A0
+        # Contributions du numérateur (swap parity)
         c[0] += self.discount_factor(U[0]) / A0
         c[-1] += -self.discount_factor(U[-1]) / A0
 
-        # Annuity contribution: -(S0/A0) * Delta_i * P(0,Ti)
+        # Contribution annuité : -(S0/A0) * Delta_i * P(0,Ti)
         for i in range(1, m):
             Ti = U[i]
             delta = U[i] - U[i - 1]
@@ -85,34 +140,52 @@ class HullWhite2FPricer:
         return U, c, A0, S0
 
     # ---------------------------------------
-    # HW2F bond options (closed form via v^2)
+    # Options sur ZC bond (fermé via v^2(T,S))
     # ---------------------------------------
 
     def zero_bond_put_hw2f(self, T: float, S: float, K: float) -> float:
         """
-        Put option on ZC bond P(T,S) with strike K (bond price strike), priced at time 0.
+        Put européen sur ZC bond P(T,S) de strike K (strike sur le prix du bond),
+        valorisé à t=0 sous HW2F.
 
-        Put = K P(0,T) N(-d2) - P(0,S) N(-d1)
-        d1 = [ln(P(0,S)/(K P(0,T))) + 0.5 v^2]/v
-        d2 = d1 - v
-        where v^2 = model.v2_caplet(T,S).
+        Formule (analogue "Black" sur ZC bond) :
+          Put = K P(0,T) N(-d2) - P(0,S) N(-d1)
+          d1 = [ln(P(0,S)/(K P(0,T))) + 0.5 v^2] / v
+          d2 = d1 - v
+        où v^2 = model.v2_caplet(T,S).
+
+        Paramètres
+        ----------
+        T : float
+            Expiry de l'option (en années).
+        S : float
+            Maturité du bond (S > T).
+        K : float
+            Strike (prix du bond) > 0.
+
+        Retourne
+        --------
+        float
+            PV du put.
         """
         T = float(T)
         S = float(S)
         K = float(K)
+
         if S <= T:
-            raise ValueError("Bond option requires S > T.")
+            raise ValueError("Bond option doit avoir S > T.")
         if K <= 0:
-            raise ValueError("Bond option strike K must be > 0.")
+            raise ValueError("Bond option strike K doit être > 0.")
 
         P0T = self.discount_factor(T)
         P0S = self.discount_factor(S)
 
+        # Variance v^2(T,S) (fermée) puis vol v
         v2 = self.model.v2_caplet(T, S)
         v = np.sqrt(max(v2, 0.0))
 
         if v < 1e-16:
-            # Nearly deterministic
+            # Cas quasi déterministe : payoff intrinsèque actualisé
             return float(max(K * P0T - P0S, 0.0))
 
         ln_term = np.log(P0S / (K * P0T))
@@ -124,17 +197,34 @@ class HullWhite2FPricer:
 
     def zero_bond_call_hw2f(self, T: float, S: float, K: float) -> float:
         """
-        Call option on ZC bond P(T,S), priced at time 0.
+        Call européen sur ZC bond P(T,S) de strike K, valorisé à t=0 sous HW2F.
 
-        Call = P(0,S) N(d1) - K P(0,T) N(d2)
+        Formule :
+          Call = P(0,S) N(d1) - K P(0,T) N(d2)
+        avec d1, d2 définis comme dans zero_bond_put_hw2f.
+
+        Paramètres
+        ----------
+        T : float
+            Expiry.
+        S : float
+            Maturité (S > T).
+        K : float
+            Strike > 0.
+
+        Retourne
+        --------
+        float
+            PV du call.
         """
         T = float(T)
         S = float(S)
         K = float(K)
+
         if S <= T:
-            raise ValueError("Bond option requires S > T.")
+            raise ValueError("Bond option doit avoir S > T.")
         if K <= 0:
-            raise ValueError("Bond option strike K must be > 0.")
+            raise ValueError("Bond option strike K doit être > 0.")
 
         P0T = self.discount_factor(T)
         P0S = self.discount_factor(S)
@@ -143,6 +233,7 @@ class HullWhite2FPricer:
         v = np.sqrt(max(v2, 0.0))
 
         if v < 1e-16:
+            # Cas quasi déterministe : payoff intrinsèque actualisé
             return float(max(P0S - K * P0T, 0.0))
 
         ln_term = np.log(P0S / (K * P0T))
@@ -153,14 +244,32 @@ class HullWhite2FPricer:
         return float(call)
 
     # -----------------------
-    # Caplet pricing under 2F
+    # Caplet pricing sous 2F
     # -----------------------
 
     def caplet_hw2f(self, T1: float, T2: float, N: float, K: float) -> float:
         """
-        Caplet PV under HW2F via ZC bond put:
-            Caplet = N * (1 + K*Delta) * PutZC(T1, T2, 1/(1+K*Delta))
-        with Delta = T2 - T1.
+        PV d'un caplet sous HW2F via put sur ZC bond.
+
+        Relation standard :
+          Caplet = N * (1 + K*Delta) * PutZC(T1, T2, 1/(1+K*Delta))
+        avec Delta = T2 - T1.
+
+        Paramètres
+        ----------
+        T1 : float
+            Fixing (expiry du caplet).
+        T2 : float
+            Paiement (T2 > T1).
+        N : float
+            Notional.
+        K : float
+            Strike en "rate units" (ex: 0.03).
+
+        Retourne
+        --------
+        float
+            PV du caplet.
         """
         T1 = float(T1)
         T2 = float(T2)
@@ -168,18 +277,18 @@ class HullWhite2FPricer:
         K = float(K)
 
         if T2 <= T1:
-            raise ValueError("Caplet requires T2 > T1.")
+            raise ValueError("Caplet doit avoir T2 > T1.")
         if N <= 0:
-            raise ValueError("Notional N must be > 0.")
+            raise ValueError("Notional N doit être > 0.")
         if K < 0:
-            raise ValueError("Strike K must be >= 0.")
+            raise ValueError("Strike K doit être >= 0.")
 
         Delta = T2 - T1
         K_bond = 1.0 + K * Delta
         if K_bond <= 0:
-            raise ValueError("Invalid (1 + K*Delta) <= 0.")
+            raise ValueError("(1 + K*Delta) <= 0 n'est pas valide.")
 
-        # Bond option strike on P(T1, T2)
+        # Strike de l'option sur P(T1,T2)
         K_zc = 1.0 / K_bond
 
         put_zc = self.zero_bond_put_hw2f(T1, T2, K_zc)
@@ -187,42 +296,65 @@ class HullWhite2FPricer:
         return float(caplet)
 
     # ----------------------------------------------
-    # Swaption pricing under 2F via Gaussian approx
+    # Swaption pricing sous 2F (approx gaussienne)
     # ----------------------------------------------
 
     def swaption_approx_hw2f(self, Tau, N: float, K: float, payer: bool = True) -> float:
         """
-        Swaption PV using:
-          - frozen weights Gaussian swap-rate approximation
-          - HW2F closed-form integrals I_aa, I_bb, I_ab
-          - Bachelier (normal) pricing on swap rate
+        PV d'une swaption via :
+          - approximation gaussienne du swap rate avec poids figés
+          - intégrales fermées HW2F : I_aa, I_bb, I_ab
+          - pricing Bachelier (normal) sur le swap rate
 
+        Paramètres
+        ----------
         Tau : list[float]
-            [T0, T1, ..., Tn] fixed payment schedule (T0 is option expiry / swap start)
+            Schedule fixe [T0, T1, ..., Tn] (T0 = expiry / start).
+        N : float
+            Notional.
+        K : float
+            Strike en "rate units" (ex: 0.03).
+        payer : bool
+            True = payer swaption ; False = receiver swaption.
+
+        Retourne
+        --------
+        float
+            PV de la swaption.
+
+        Remarques
+        ---------
+        - Ici, on utilise S0 (swap rate forward) et A0 (annuité) calculés à t=0.
+        - La variance du swap rate à l'expiry T est :
+            Var[S(T)] = sigma^2 Qaa + eta^2 Qbb + 2 rho sigma eta Qab
+          où Q.. proviennent des doubles sommes sur les poids figés et les intégrales I_.. .
         """
         Tau = [float(x) for x in Tau]
         N = float(N)
         K = float(K)
+
+        # Vérifications d'entrée
         if len(Tau) < 2:
-            raise ValueError("Tau must contain at least [T0, Tn].")
+            raise ValueError("Tau doit contenir au moins [T0, Tn].")
         if N <= 0:
-            raise ValueError("Notional N must be > 0.")
+            raise ValueError("Notional N doit être > 0.")
 
         T = Tau[0]  # expiry
         if T <= 0:
-            raise ValueError("Swaption expiry T must be > 0 for this method.")
+            # Cas expiry immédiate non géré par cette approximation
+            raise ValueError("Swaption expiry T doit être > 0 pour cette méthode.")
 
-        # Build frozen weights and swap quantities at time 0
+        # Construction des poids figés + A0, S0
         U, c, A0, S0 = self._swaption_weights_frozen(Tau)
 
-        # Model parameters
+        # Paramètres du modèle
         a = self.model.parameters["a"]
         b = self.model.parameters["b"]
         rho = self.model.parameters["rho"]
         sigma = self.model.parameters["sigma"]
         eta = self.model.parameters["eta"]
 
-        # Compute Qaa, Qbb, Qab via double sums (small matrices => fine)
+        # Calcul des Qaa, Qbb, Qab par double somme
         Qaa = 0.0
         Qbb = 0.0
         Qab = 0.0
@@ -239,17 +371,20 @@ class HullWhite2FPricer:
                 Qbb += ci * cj * HullWhite2FModel.I_bb(T, Ui, Uj, b)
                 Qab += ci * cj * HullWhite2FModel.I_ab(T, Ui, Uj, a, b)
 
+        # Variance du swap rate à l'expiry
         varS = (sigma * sigma) * Qaa + (eta * eta) * Qbb + 2.0 * rho * sigma * eta * Qab
         varS = float(max(varS, 0.0))
 
-        # Convert to normal vol on swap rate
+        # Cas variance quasi nulle : payoff intrinsèque à l'expiry (actualisé via annuité)
         if varS < 1e-30:
             w = 1.0 if payer else -1.0
             return float(N * A0 * max(w * (S0 - K), 0.0))
 
+        # Conversion variance -> vol normal du swap rate (Bachelier) :
+        # Var[S(T)] = sigmaN^2 * T  => sigmaN = sqrt(varS / T)
         sigmaN = np.sqrt(varS / T)
 
-        # Bachelier pricing
+        # Pricing Bachelier
         d = (S0 - K) / (sigmaN * np.sqrt(T))
         w = 1.0 if payer else -1.0
 

@@ -4,12 +4,7 @@ ir/market/loaders_excel.py
 
 Loaders Excel -> objets "propres" (Curve + QuoteSets) pour notebooks.
 
-Objectifs:
-- Remplacer le glue-code notebook:
-    pd.read_excel(...), parse Payment_Dates, construire market_prices dict
-- Sans changer tes pricers/calibrators: on retourne exactement ce qu'ils attendent.
-
-Usage typique notebook:
+Usage typique notebook :
     curve = load_curve_xlsx(path)
     swpn = load_swaption_template_xlsx(path)
     market_dict = swpn.to_market_dict()
@@ -19,41 +14,42 @@ from __future__ import annotations
 
 import ast
 from typing import Optional
-
 import pandas as pd
+from ir.market.curve import Curve
+from ir.instruments.base import SwaptionQuoteSet, CapletQuoteSet
 
-# Imports robustes (migration progressive)
-try:
-    from ir.market.curve import Curve
-except Exception:  # pragma: no cover
-    from curve_builder import Curve  # type: ignore
-
-try:
-    from ir.instruments.base import SwaptionQuoteSet, CapletQuoteSet
-except Exception:  # pragma: no cover
-    from instruments.base import SwaptionQuoteSet, CapletQuoteSet  # type: ignore
 
 
 def _parse_list_cell(x) -> list[float]:
     """
-    Parse une cellule Excel supposée contenir une liste:
-      - déjà list/tuple -> cast float
-      - string "[0.5, 1.0, ...]" -> ast.literal_eval
+    Parse une cellule Excel supposée contenir une liste de dates (year fractions).
+
+    Retourne
+    --------
+    list[float]
+
+    Erreurs
+    -------
+    - ValueError si la cellule ne peut pas être interprétée comme une liste de floats.
     """
+    # Cas 1 : déjà une liste/tuple (certains exports Excel ou pré-traitements peuvent faire ça)
     if isinstance(x, (list, tuple)):
         return [float(v) for v in x]
+
+    # Cas 2 : string contenant une représentation de liste
     if isinstance(x, str):
         s = x.strip()
         if not s:
             return []
         try:
-            obj = ast.literal_eval(s)  # safe eval (contrairement à eval)
+            obj = ast.literal_eval(s)
             if isinstance(obj, (list, tuple)):
                 return [float(v) for v in obj]
         except Exception:
             pass
-    # fallback
-    raise ValueError(f"Cannot parse payment dates cell: {x!r}")
+
+    # Fallback : format non reconnu
+    raise ValueError(f"Format de dates de paiement non reconnu: {x!r}")
 
 
 def load_curve_xlsx(
@@ -64,19 +60,34 @@ def load_curve_xlsx(
     smooth: float = 1e-7,
 ) -> Curve:
     """
-    Read curve sheet and build Curve(time, discount_factors).
+    Lit une feuille Excel contenant les nœuds de courbe et construit un objet Curve.
 
-    Parameters
+    Paramètres
     ----------
-    path: xlsx path
-    sheet: sheet name containing curve nodes
-    time_col: column with year fractions
-    df_col: column with discount factors
-    smooth: passed to Curve (forward spline smoothing)
+    path : str
+        Chemin du fichier Excel (.xlsx).
+    sheet : str
+        Nom de la feuille contenant la courbe (par défaut "Curve").
+    time_col : str
+        Colonne contenant les maturités en années (year fractions).
+    df_col : str
+        Colonne contenant les discount factors P(0,T).
+    smooth : float
+        Paramètre de lissage transmis à Curve (utilisé pour la spline des forwards instantanés).
+
+    Retourne
+    --------
+    Curve
+        Objet courbe (interpolation DF + spline forward).
     """
+    # Lecture Excel (pandas gère l'engine automatiquement dans la plupart des cas)
     df = pd.read_excel(path, sheet_name=sheet)
+
+    # Extraction + cast explicite en float (sécurité type)
     time = df[time_col].astype(float).values
     disc = df[df_col].astype(float).values
+
+    # Construction de la courbe
     return Curve(time, disc, smooth=smooth)
 
 
@@ -90,27 +101,38 @@ def load_swaption_template_xlsx(
     payer_col: Optional[str] = None,
 ) -> SwaptionQuoteSet:
     """
-    Read swaption calibration template (your SWPN_Calibration_Template_...xlsx).
+    Lit un fichier template de calibration swaptions (type SWPN_Calibration_Template_...xlsx)
+    et retourne un SwaptionQuoteSet prêt à l’emploi.
 
-    Expected columns (minimum):
-      - Price, Strike, Notional, Payment_Dates
-    Optionally:
-      - Payer (bool) if provided in payer_col or column named "Payer"
+    Colonnes attendues (minimum)
+    ----------------------------
+    - Price, Strike, Notional, Payment_Dates
+
+    Optionnel
+    ---------
+    - Payer (bool) :
+        * soit fourni via le paramètre payer_col (nom de colonne)
+        * soit déjà présent dans le fichier sous le nom "Payer"
+
     """
+    # Lecture de la feuille template
     df = pd.read_excel(path, sheet_name=sheet)
 
-    # Payment_Dates: string like "[0.5, 1.0, ...]" -> list[float]
     if payment_dates_col in df.columns:
         df[payment_dates_col] = [_parse_list_cell(v) for v in df[payment_dates_col].tolist()]
     else:
         raise KeyError(f"Missing column '{payment_dates_col}' in {sheet}.")
 
-    # Payer flags (optional)
+    # --- Gestion du flag payer/receiver (optionnel) ---
+    # Objectif : exposer une colonne standard "Payer" si possible
     if payer_col and payer_col in df.columns:
+        # Si l'utilisateur indique une colonne, on la copie/normalise
         df["Payer"] = df[payer_col].astype(bool)
     elif "Payer" in df.columns:
+        # Sinon, si la colonne s'appelle déjà "Payer", on la cast en bool
         df["Payer"] = df["Payer"].astype(bool)
 
+    # Construction du QuoteSet avec la référence de colonnes
     return SwaptionQuoteSet(
         df=df,
         price_col=price_col,
@@ -132,28 +154,30 @@ def load_caplet_template_xlsx(
     maturity_col: str = "Maturity",
 ) -> CapletQuoteSet:
     """
-    Read caplet calibration template (your CAP_Calibration_Template_...xlsx).
+    Lit un fichier template de calibration caplets (type CAP_Calibration_Template_...xlsx)
+    et retourne un CapletQuoteSet prêt à l’emploi.
 
-    Notes
-    -----
-    In your notebook you did: df = pd.read_excel(...).iloc[1:,:]
-    Sometimes first row is blank/header-like; we offer drop_first_row_if_empty.
     """
+    # Lecture du template
     df = pd.read_excel(path, sheet_name=sheet)
 
+    # Option : suppression heuristique de la première ligne si elle est "vide" sur les champs essentiels
     if drop_first_row_if_empty and len(df) >= 1:
-        # heuristic: if first row has NaNs for essential fields -> drop it
         essentials = [price_col, strike_col, notional_col, expiry_col, maturity_col]
+        # Petite protection : on ne lance l'heuristique que si au moins une colonne essentielle existe
         if any(col in df.columns for col in essentials):
             row0 = df.iloc[0]
+            # On considère la ligne 0 "mauvaise" si toutes les colonnes essentielles sont NaN
             bad = True
             for col in essentials:
                 if col in df.columns and pd.notna(row0[col]):
                     bad = False
                     break
+            # Si la ligne 0 semble inutile, on la drop et on réindexe proprement
             if bad:
                 df = df.iloc[1:, :].reset_index(drop=True)
 
+    # Construction du QuoteSet caplets avec les colonnes configurées
     return CapletQuoteSet(
         df=df.reset_index(drop=True),
         price_col=price_col,
@@ -166,7 +190,7 @@ def load_caplet_template_xlsx(
 
 def load_cap_market_data_xlsx(path: str) -> pd.DataFrame:
     """
-    Read OTM caplet market data file (your CAP_Market_Data_...xlsx).
-    Returns DataFrame as-is (smile filtering remains notebook-side, by design).
+    Lit un fichier de données de marché caplets OTM (type CAP_Market_Data_...xlsx)
+    et renvoie le DataFrame tel quel.
     """
     return pd.read_excel(path)

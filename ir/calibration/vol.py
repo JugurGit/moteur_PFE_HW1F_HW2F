@@ -1,52 +1,84 @@
 from scipy.optimize import minimize, brentq
 import numpy as np
-from scipy.stats import norm 
+from scipy.stats import norm
 import itertools
 
 
-# Bachelier (normal) vol from price
+# ----------------------------
+# Vol implicite Bachelier (normal) à partir d'un prix
+# ----------------------------
 def black_normal_vol(price, forward, strike, expiry, notional, annuity):
     """
-    Computes the normal (Bachelier) implied volatility (in basis points) from a swaption or caplet price.
+    Calcule la volatilité implicite normale (Bachelier) à partir d'un prix de marché
+    (swaption ou caplet).
 
-    Parameters
+    Conventions
+    ----------
+    - forward et strike sont supposés fournis en % (ex: 3.25), puis convertis en taux (0.0325).
+    - La volatilité sigma retournée est une volatilité normale "en taux" puis convertie en bps.
+
+    Paramètres
     ----------
     price : float
-        Market price of the swaption or caplet.
+        Prix de marché (PV) de l'instrument.
     forward : float
-        Forward swap rate.
+        Taux forward (swap rate forward ou forward caplet), exprimé en %.
     strike : float
-        Swaption strike rate.
+        Strike, exprimé en %.
     expiry : float
-        Time to expiry in years.
+        Maturité/échéance en années (T).
     notional : float
-        Notional amount of the swaption or caplet.
+        Nominal de l'instrument.
     annuity : float
-        Annuity factor for the swaption or caplet (DF x Year Frac.).
+        Facteur d'annuité (souvent somme des DF * accruals pour swaptions),
+        ou DF*yearfrac pour un caplet, selon ta convention de pricing.
 
-    Returns
-    -------
+    Retourne
+    --------
     float
-        Implied normal volatility in basis points (bps).
+        Volatilité implicite normale en basis points (bps).
     """
-    forward = forward / 100  # convert percentage to rate units
-    strike = strike / 100    # convert percentage to rate units
+    # Conversion : % -> taux décimaux
+    forward = forward / 100.0
+    strike = strike / 100.0
 
     def bachelier_price(sigma):
+        """
+        Prix Bachelier (normal model) pour une option de type call sur taux :
+          PV = annuity * notional * [ (F-K) * N(d) + sigma*sqrt(T) * n(d) ]
+        avec d = (F-K)/(sigma*sqrt(T))
+
+        Remarque : ici on ne gère pas explicitement payer/receiver (w),
+        on est sur la formule "call" standard (payer swaption).
+        """
+        # Sécurité : vol <= 0 => prix nul (pour éviter divisions par zéro)
         if sigma <= 0:
             return 0.0
+
+        # d de Bachelier
         d = (forward - strike) / (sigma * np.sqrt(expiry))
-        price_model = annuity * notional * ((forward - strike) * norm.cdf(d) + sigma * np.sqrt(expiry) * norm.pdf(d))
-        return price_model
+
+        # Prix modèle (PV)
+        price_model = annuity * notional * (
+            (forward - strike) * norm.cdf(d)
+            + sigma * np.sqrt(expiry) * norm.pdf(d)
+        )
+        return float(price_model)
 
     def objective(sigma):
+        """
+        Équation d'inversion : on cherche sigma tel que
+        bachelier_price(sigma) = price  <=> objective(sigma) = 0
+        """
         return bachelier_price(sigma) - price
 
-    # Reasonable bounds for normal vols (in rate units)
+    # Bornes raisonnables pour sigma en "taux" (unités décimales).
+    # 1e-6 évite les divisions par zéro ; 5.0 est volontairement large.
     try:
         sigma_normal = brentq(objective, 1e-6, 5.0)
-        
     except ValueError as e:
         sigma_normal = np.nan
-        print(f"Warning: Could not solve for vol: {e}")
-    return sigma_normal * 10000  # convert to bps
+        print(f"Warning: Impossible de résoudre la vol implicite : {e}")
+
+    # Conversion taux -> bps : 1.0 = 10000 bps
+    return sigma_normal * 10000.0

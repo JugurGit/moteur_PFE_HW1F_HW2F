@@ -5,100 +5,121 @@ import numpy as np
 
 class Curve:
     """
-    Class to handle market curves, including discount factors and
-    instantaneous forward rates, with cubic interpolation and spline smoothing.
+    Classe pour manipuler une courbe de marché, notamment :
+    - les facteurs d’actualisation P(0,t)
+    - les taux forwards instantanés f(0,t)
+    avec :
+    - interpolation cubique des discount factors
+    - spline (lissée) sur log(P(0,t)) pour dériver un forward instantané stable
     """
 
     def __init__(self, time, discount_factors, smooth=1e-7):
         """
-        Initializes a market curve object containing the discount curve
-        and the corresponding instantaneous forward curve.
+        Initialise une courbe de marché (discount curve) et construit en même temps
+        les objets d’interpolation nécessaires.
 
-        Parameters
+        Paramètres
         ----------
         time : array_like
-            Time to maturity (in years) of the curve nodes.
+            Maturités (en années) des nœuds de la courbe.
         discount_factors : array_like
-            Discount factors at the given maturities.
-        smooth : float, optional
-            Smoothing parameter for the forward spline interpolation (default: 1e-7).
+            Facteurs d’actualisation P(0, T) aux maturités fournies.
+        smooth : float, optionnel
+            Paramètre de lissage de la spline sur log(P).
         """
         self.time = np.array(time)
         self.discount_factors = np.array(discount_factors)
         self.smooth = smooth
 
+        # Construction des interpolateurs (DF + spline de forwards instantanés)
         self._build_interpolators()
 
     def _build_interpolators(self):
         """
-        Builds both the discount factor interpolation function and
-        the instantaneous forward rate spline in a single step.
+        Construit en une fois :
+        1) une fonction d’interpolation des discount factors P(0,t)
+        2) une spline sur ln(P(0,t)) permettant d’obtenir f(0,t) par dérivation
+
+        Pourquoi une spline sur ln(P) ?
+        -------------------------------
+        En théorie :
+          f(0,t) = - d/dt ln P(0,t)
+        Donc si on approxime ln(P) par une spline suffisamment régulière,
+        la dérivée donne un forward instantané plus stable numériquement.
         """
-        # Cubic interpolation for discount factors
+
         self.discount_func = interp1d(
             self.time,
             self.discount_factors,
-            kind='cubic',
+            kind="cubic",
             fill_value="extrapolate",
-            bounds_error=False
+            bounds_error=False,
         )
 
-        # Spline for the log of discount factors (needed for forward rate derivation)
         lnP = np.log(self.discount_factors)
         self.forward_spline = UnivariateSpline(self.time, lnP, s=self.smooth)
 
     def discount(self, t):
         """
-        Returns the interpolated discount factor P(0, t).
+        Retourne le facteur d’actualisation interpolé P(0,t).
 
-        Parameters
+        Paramètres
         ----------
-        t : float or array_like
-            Time(s) to maturity.
+        t : float ou array_like
+            Temps / maturité(s) en années.
 
-        Returns
-        -------
-        float or np.ndarray
-            Discount factor(s) corresponding to t.
+        Retourne
+        --------
+        float ou np.ndarray
+            Valeur(s) P(0,t) interpolée(s).
         """
         return self.discount_func(t)
 
     def inst_forward_rate(self, t):
         """
-        Returns the interpolated instantaneous forward rate f(0, t).
+        Retourne le taux forward instantané interpolé f(0,t).
 
-        Parameters
-        ----------
-        t : float or array_like
-            Time(s) to maturity.
-
-        Returns
+        Formule
         -------
-        float or np.ndarray
-            Instantaneous forward rate(s) corresponding to t.
+          f(0,t) = - d/dt ln P(0,t)
+
+        Paramètres
+        ----------
+        t : float ou array_like
+            Temps / maturité(s) en années.
+
+        Retourne
+        --------
+        float ou np.ndarray
+            Valeur(s) du forward instantané.
         """
         t = np.array(t)
+
         return -self.forward_spline.derivative(1)(t)
-    
 
     def forward_rate(self, T1, T2):
         """
-        Computes the simple forward rate F(0; T1, T2) implied by the discount curve.
+        Calcule le taux forward simple F(0; T1, T2) implicite de la courbe de DF.
 
-        Parameters
+        Convention (forward simple)
+        ---------------------------
+          F(0;T1,T2) = ( P(0,T1)/P(0,T2) - 1 ) / (T2 - T1)
+
+        Paramètres
         ----------
         T1 : float
-            Start time of the forward rate.
+            Début de la période.
         T2 : float
-            End time of the forward rate.
+            Fin de la période.
 
-        Returns
-        -------
+        Retourne
+        --------
         float
-            Forward rate between T1 and T2.
+            Taux forward simple entre T1 et T2.
         """
-        
+        # Récupération des DF interpolés
         P1 = self.discount(T1)
         P2 = self.discount(T2)
 
+        # Application de la formule du forward simple (suppose T2 > T1)
         return (P1 / P2 - 1.0) / (T2 - T1)

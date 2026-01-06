@@ -13,12 +13,19 @@ from ir.risk.hw2f_sim import HW2FCurveSim
 from ir.pricers.hw1f_pricer import HullWhitePricer
 from ir.pricers.hw2f_pricer import HullWhite2FPricer
 
+
+# =============================
+# PAGE : PFE SWAP
+# =============================
 st.markdown("# PFE Swap")
 st.caption("Calcule PFE/EPE pour un swap vanilla, en réutilisant un run (session ou DB) sans recalibrer.")
 
 # -------------------------
-# Source selection
+# 1) Sélection de la source du run
 # -------------------------
+# Objectif : récupérer (modèle, params, courbe) depuis :
+#   - Session (last_run) : résultat de la calibration HW1F/HW2F en session
+#   - Database : runs sauvegardés en base (via pages calibration)
 st.subheader("Run source")
 
 src = st.radio(
@@ -35,15 +42,19 @@ run_curve = None
 if src.startswith("Session"):
     last_run = st.session_state.get("last_run", None)
     if last_run is None:
-        st.warning("Aucun `last_run` en session. Va d’abord sur Calibration HW1F/HW2F (pages 2/3) ou charge un run DB.", icon="⚠️")
+        st.warning(
+            "Aucun `last_run` en session. Va d’abord sur Calibration HW1F/HW2F (pages 2/3) ou charge un run DB.",
+            icon="⚠️",
+        )
     else:
         selected_run = last_run
         run_model = last_run.get("model")
         run_params = last_run.get("params")
-        run_curve = None  # en session tu as déjà curve via pricer, sinon via snapshot si présent
+        run_curve = None  
         st.info(f"Run session détecté: model={run_model}, source={last_run.get('source_file')}", icon="🧠")
 
 else:
+    # Cas DB : on liste les runs sauvegardés et on en charge un
     runs = list_runs(limit=200)
     if not runs:
         st.warning("Aucun run en DB. Sauvegarde un run depuis Calibration HW1F/HW2F.", icon="⚠️")
@@ -61,14 +72,15 @@ else:
                 selected_run = db_run
                 run_model = db_run.get("model")
                 run_params = db_run.get("params")
-                run_curve = curve_from_dict(db_run.get("curve"))
+                run_curve = curve_from_dict(db_run.get("curve"))  # reconstruction Curve depuis dict JSON
                 st.success(f"Run DB chargé ✅  (id={rid}, model={run_model})", icon="✅")
 
 st.divider()
 
 # -------------------------
-# Swap + MC inputs
+# 2) Inputs du swap + paramètres Monte Carlo
 # -------------------------
+# On définit le swap (notional, K, schedule Tau) + la grille de temps pour calculer PFE/EPE
 st.subheader("Swap inputs")
 
 col1, col2, col3, col4 = st.columns(4)
@@ -86,28 +98,38 @@ with col3:
     tau_str = st.text_input("Tau schedule (years)", value="0.0,0.5,1.0,1.5,2.0,2.5,3.0,3.5,4.0,4.5,5.0")
 
 with col4:
+    # Paramètres MC génériques (valables 1F et 2F côté simulateur)
     n_paths = st.number_input("MC paths", value=20000, min_value=1000, step=1000)
     seed = st.number_input("Seed", value=2025, step=1)
     n_steps_1f = st.number_input("HW1F steps (Euler)", value=252, min_value=50, step=10)
 
+
 def _parse_tau(s: str):
+    """Parse '0.0,0.5,1.0' -> [0.0,0.5,1.0]."""
     return [float(x.strip()) for x in s.split(",") if x.strip()]
+
 
 Tau = _parse_tau(tau_str)
 grid = np.linspace(0.0, float(Tau[-1]), int(grid_n))
 
 st.divider()
 
-# --- Progress UI helpers ---
+# -------------------------
+# 3) Options d'affichage de la progression
+# -------------------------
+# pfe_profile_swap a été patché pour accepter un progress_cb optionnel,
+# avec un mode détaillé (par cashflow) quand la schedule est longue.
 st.subheader("Run controls")
 
 colA, colB, colC = st.columns([1.0, 1.0, 1.2])
+
 with colA:
     inner_progress = st.checkbox(
         "Show detailed progress (per cashflow)",
         value=False,
         help="Affiche une progression plus fine (à l'intérieur de chaque point de grille). Peut être un peu plus lent côté UI.",
     )
+
 with colB:
     inner_every = st.number_input(
         "Update frequency (cashflows)",
@@ -116,6 +138,7 @@ with colB:
         step=1,
         help="Si le mode détaillé est activé: update toutes les N cashflows.",
     )
+
 with colC:
     show_table = st.checkbox(
         "Show progress table",
@@ -127,7 +150,14 @@ status_ph = st.empty()
 bar_ph = st.empty()
 table_ph = st.empty()
 
+
 def _run_with_progress(curve_sim, title: str):
+    """
+    Lance pfe_profile_swap en branchant un callback Streamlit pour :
+      - barre de progression
+      - statut texte (grid/cashflows)
+      - mini table des events
+    """
     st.session_state["pfe_progress_rows"] = []
     prog = bar_ph.progress(0, text="Initialisation Monte Carlo...")
 
@@ -189,25 +219,27 @@ def _run_with_progress(curve_sim, title: str):
 
 
 # -------------------------
-# Build curve_sim without recalibration
+# 4) Reconstruction d'un "curve_sim" à partir du run sélectionné
 # -------------------------
+# Ici on évite TOTALEMENT la recalibration :
+#   - HW1F: on construit un HullWhitePricer avec params + curve -> curve_sim (HullWhiteCurveBuilder)
+#   - HW2F: on construit un HullWhite2FPricer (analytique) + un HW2FCurveSim (MC sur x,y)
 def _build_curve_sim_from_selected_run():
     if selected_run is None:
         return None, None
 
     model = (run_model or "").strip()
 
-    # --- CASE 1: DB run -> run_curve already reconstructed ---
+    # --- Courbe ---
+    # DB : déjà reconstruite via curve_from_dict
+    # Session : on essaie (a) snapshot de courbe dans last_run, sinon (b) pricer en session_state
     if run_curve is not None:
         curve = run_curve
     else:
-        # session fallback:
-        # if curve snapshot exists in session last_run, use it
         snap = selected_run.get("curve", None)
         if snap:
             curve = curve_from_dict(snap)
         else:
-            # or reuse curve from pricer in session_state if available
             if model == "HW1F" and "hw1f_pricer" in st.session_state:
                 curve = st.session_state["hw1f_pricer"].curve
             elif model == "HW2F" and "hw2f_pricer" in st.session_state:
@@ -216,12 +248,15 @@ def _build_curve_sim_from_selected_run():
                 st.error("Impossible de reconstruire la courbe: ni snapshot `curve`, ni pricer en session.")
                 return None, None
 
+    # --- Paramètres ---
     params = run_params or selected_run.get("params", None)
     if not isinstance(params, dict):
         st.error("Paramètres modèle manquants/incohérents dans le run.")
         return None, None
 
+    # --- Construction simulateur selon modèle ---
     if model == "HW1F":
+        # On (re)crée un pricer 1F uniquement pour récupérer curve_sim (et le model params)
         pricer = HullWhitePricer(
             curve,
             n_paths=int(n_paths),
@@ -229,17 +264,19 @@ def _build_curve_sim_from_selected_run():
             seed=int(seed),
             hw_params=params,
         )
-        # curve_sim is HullWhiteCurveBuilder
         return pricer.curve_sim, {"curve": curve, "model": "HW1F", "params": pricer.model.parameters}
 
     if model == "HW2F":
+        # Pricer 2F -> fournit model (paramètres + fonctions fermées)
         pricer2 = HullWhite2FPricer(curve, hw2f_params=params)
+
+        # Simu 2F : distribution de P(t,T) via tirages (x_t, y_t)
         curve_sim_2f = HW2FCurveSim(
             curve=curve,
             model=pricer2.model,
             n_paths=int(n_paths),
             seed=int(seed),
-            use_legacy_global_seed=True,
+            use_legacy_global_seed=True, 
         )
         return curve_sim_2f, {"curve": curve, "model": "HW2F", "params": pricer2.model.parameters}
 
@@ -248,7 +285,7 @@ def _build_curve_sim_from_selected_run():
 
 
 # -------------------------
-# Run button
+# 5) Bouton "Run" + affichage résultats
 # -------------------------
 do_run = st.button("🚀 Run PFE (no recalibration)", type="primary", use_container_width=True)
 
@@ -269,12 +306,14 @@ if do_run:
         }
     )
 
+    # Lancement PFE/EPE + UI progress
     with st.spinner("PFE en cours..."):
         title = f"{info['model']} | PFE swap"
         pfe, epe = _run_with_progress(curve_sim, title=title)
 
     st.success("Terminé ✅", icon="✅")
 
+    # Affichage des résultats + export
     st.subheader("Results")
     df_out = pd.DataFrame({"t": grid, "PFE": pfe, "EPE": epe})
     st.dataframe(df_out, use_container_width=True, height=260)

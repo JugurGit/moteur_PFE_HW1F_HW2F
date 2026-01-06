@@ -2,19 +2,14 @@
 """
 pfe_swap.py
 
-Exposure / PFE utilities for a vanilla IRS (swap) under a curve simulator.
+Utilitaires d'exposition / PFE pour un IRS vanilla (swap) sous un simulateur de courbe.
 
-Compatibility
+Compatibilité
 -------------
-Works with:
-- HullWhiteCurveBuilder (1F): object has zero_coupon_bond(t,T) and sim.n_paths
-- HW2FCurveSim (2F): object has zero_coupon_bond(t,T) and n_paths
+Fonctionne avec :
+- HullWhiteCurveBuilder (1F) : l'objet expose zero_coupon_bond(t,T) et sim.n_paths
+- HW2FCurveSim (2F)         : l'objet expose zero_coupon_bond(t,T) et n_paths
 
-Patch (progress)
-----------------
-- Adds optional progress callback to display live progress in Streamlit:
-  * per grid node (always)
-  * optional intra-node progress (per cashflow) for long Tau schedules
 """
 
 from __future__ import annotations
@@ -27,14 +22,26 @@ import numpy as np
 
 def _get_n_paths(curve_sim) -> int:
     """
-    Try to infer the number of Monte Carlo paths from the simulator object.
+    Déduit le nombre de scénarios Monte Carlo depuis l'objet simulateur.
+
+    Pourquoi ?
+    ----------
+    Tes deux simulateurs (1F vs 2F) n’exposent pas forcément le même attribut :
+    - HW2F : curve_sim.n_paths
+    - HW1F : curve_sim.sim.n_paths (via HullWhiteCurveBuilder.sim)
+
+    Retourne
+    --------
+    int
+        Nombre de paths.
+
     """
     if hasattr(curve_sim, "n_paths"):
         return int(curve_sim.n_paths)
     if hasattr(curve_sim, "sim") and hasattr(curve_sim.sim, "n_paths"):
         return int(curve_sim.sim.n_paths)
     raise AttributeError(
-        "Cannot infer number of paths. Expected curve_sim.n_paths or curve_sim.sim.n_paths."
+        "Objets attendus : curve_sim.n_paths ou curve_sim.sim.n_paths."
     )
 
 
@@ -51,67 +58,86 @@ def swap_mtm_distribution_at_t(
     inner_every: int = 3,
 ) -> np.ndarray:
     """
-    Distribution de V(t) (PV à t) d'un swap vanilla.
+    Calcule la distribution de V(t) (MTM/PV à la date t) d'un swap vanilla.
 
-    Parameters
+    Idée
+    ----
+    On valorise le swap à la date t sur chaque scénario en utilisant les ZC bonds simulés :
+      - Jambe flottante : P(t,T0) - P(t,Tm)
+      - Jambe fixe      : K * A(t) où A(t)=∑ Delta_i * P(t,Ti) (annuité)
+
+    Puis :
+      V(t) = N * w * (float_leg - fixed_leg)
+    où w=+1 (payer) ou -1 (receiver).
+
+    Paramètres
     ----------
-    curve_sim:
-        Any object exposing zero_coupon_bond(t,T) -> ndarray.
-    t:
-        Evaluation time in years.
-    Tau:
-        Payment schedule [T0, T1, ..., Tm].
-    K:
-        Fixed rate (in rate units, e.g. 0.03 for 3%).
-    N:
-        Notional.
-    payer:
-        True for payer swap, False for receiver swap.
-    progress_cb:
-        Optional callback called during computation (to update UI).
-    progress_ctx:
-        Context dict (e.g. {"grid_i":..., "grid_n":...}) merged into callback payload.
-    inner_progress:
-        If True, calls progress_cb during annuity loop (cashflow-by-cashflow).
-    inner_every:
-        Call progress_cb every `inner_every` cashflows (to avoid too frequent UI updates).
+    curve_sim :
+        Objet expose zero_coupon_bond(t,T) -> ndarray(n_paths,)
+    t :
+        Date d'évaluation (années).
+    Tau :
+        Échéancier des paiements [T0, T1, ..., Tm] (T0 = start/expiry côté swap).
+    K :
+        Taux fixe (en unité de taux, ex 0.03).
+    N :
+        Notionnel.
+    payer :
+        True => payer swap (paye fixe, reçoit float).
+        False => receiver swap.
+    progress_cb :
+        Callback optionnel pour mise à jour UI.
+    progress_ctx :
+        Dict de contexte (ex {"grid_i":..., "grid_n":...}) fusionné dans le payload.
+    inner_progress :
+        Si True, envoie des updates pendant la boucle d'annuité (cashflows).
+    inner_every :
+        Fréquence des updates "cashflows" (pour éviter trop d’appels UI).
 
-    Returns
-    -------
-    ndarray shape (n_paths,)
-        Distribution of V(t) across paths.
+    Retourne
+    --------
+    np.ndarray
+        V(t) sur n_paths scénarios.
     """
+    # Signe selon le sens du swap
     w = 1.0 if payer else -1.0
+
     t = float(t)
     K = float(K)
     N = float(N)
 
+    # On garde uniquement les dates >= t (on "raccourcit" le swap à partir de t)
     Tau_rem = [float(Ti) for Ti in Tau if float(Ti) >= t - 1e-12]
     if len(Tau_rem) < 2:
+        # Si le swap est "terminé" (plus de cashflows), MTM = 0 sur tous les scénarios
         return np.zeros(_get_n_paths(curve_sim), dtype=float)
 
     ctx = dict(progress_ctx or {})
     ctx.update({"t": t})
 
+    # Bornes de la jambe flottante : T0 (start) et Tm (dernier paiement)
     T0 = Tau_rem[0]
     Tm = Tau_rem[-1]
 
-    # ZC for float leg endpoints
+    # ZC bonds simulés pour les deux bornes de la jambe flottante
     P_t_T0 = curve_sim.zero_coupon_bond(t, T0)
     P_t_Tm = curve_sim.zero_coupon_bond(t, Tm)
 
-    # fixed leg annuity
+    # Calcul de l'annuité A(t) = ∑ Delta_i P(t,Ti)
     annuity = 0.0
     n_cf = max(len(Tau_rem) - 1, 0)
 
     for i in range(1, len(Tau_rem)):
         Ti = Tau_rem[i]
         Delta = Tau_rem[i] - Tau_rem[i - 1]
+
+        # P(t,Ti) simulé (ndarray)
         P_t_Ti = curve_sim.zero_coupon_bond(t, Ti)
+
+        # Contribution du cashflow à l'annuité
         annuity += Delta * P_t_Ti
 
         if inner_progress and progress_cb is not None and n_cf > 0:
-            # throttle UI updates
             is_last = (i == len(Tau_rem) - 1)
             if is_last or (inner_every > 0 and (i % inner_every == 0)):
                 payload = {
@@ -123,9 +149,13 @@ def swap_mtm_distribution_at_t(
                 }
                 progress_cb(payload)
 
+    # Jambe flottante en valeur (sur chaque scénario)
     float_leg = P_t_T0 - P_t_Tm
+
+    # Jambe fixe en valeur (sur chaque scénario)
     fixed_leg = K * annuity
 
+    # MTM du swap sur chaque path
     V_t = N * w * (float_leg - fixed_leg)
     return V_t
 
@@ -143,50 +173,52 @@ def pfe_profile_swap(
     inner_every: int = 3,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Retourne PFE_q(t) et EPE(t) sur une grille.
+    Calcule un profil PFE_q(t) et EPE(t) sur une grille de temps.
 
-    Parameters
+    Définitions (sur V(t)^+ = max(V(t),0))
+    --------------------------------------
+    - PFE_q(t) = quantile_q(V(t)^+)
+    - EPE(t)   = E[V(t)^+]
+
+    Paramètres
     ----------
-    curve_sim:
-        Simulator with zero_coupon_bond(t,T) -> ndarray.
-    grid:
-        Times where to compute exposures.
-    Tau:
-        Swap payment schedule.
-    K, N, payer:
-        Swap specs.
-    q:
-        Quantile level for PFE (e.g. 0.95).
-    progress_cb:
-        Optional callback called during the run to update UI with progress.
-        Payload keys (typical):
-          - stage: "grid" or "cashflows"
-          - grid_i, grid_n, t
-          - done, total, pct
-          - elapsed_s, eta_s
-          - pfe_t, epe_t (for stage="grid")
-    inner_progress:
-        If True, emits extra progress during the cashflow loop inside each grid node.
-    inner_every:
-        Throttle for inner progress updates.
+    curve_sim :
+        Simulateur exposant zero_coupon_bond(t,T) -> ndarray.
+    grid :
+        Grille des dates (années) où on calcule l'exposition.
+    Tau :
+        Échéancier swap.
+    K, N, payer :
+        Spécifications du swap.
+    q :
+        Niveau de quantile (ex 0.95).
+    progress_cb :
+    inner_progress :
+    inner_every :
 
-    Returns
-    -------
-    (pfe, epe): tuple of ndarrays
-        Arrays aligned with grid.
+    Retourne
+    --------
+    (pfe, epe) : tuple[np.ndarray, np.ndarray]
+        Deux tableaux alignés avec grid.
     """
+    # Chrono global (utile pour ETA)
     t0 = time.perf_counter()
+
     grid = np.asarray(grid, dtype=float)
 
+    # Sorties
     pfe = np.zeros(len(grid), dtype=float)
     epe = np.zeros(len(grid), dtype=float)
 
     total_steps = int(len(grid))
     n_paths = _get_n_paths(curve_sim)
 
+    # Boucle principale : un point de grille = un calcul de distribution V(t)
     for j, t in enumerate(grid, start=1):
+        # Contexte de progression au niveau du nœud de grille
         ctx = {"grid_i": int(j), "grid_n": int(total_steps), "n_paths": int(n_paths)}
 
+        # Distribution MTM du swap à t (ndarray n_paths)
         V_t = swap_mtm_distribution_at_t(
             curve_sim,
             float(t),
@@ -200,10 +232,14 @@ def pfe_profile_swap(
             inner_every=inner_every,
         )
 
+        # Exposition positive
         V_pos = np.maximum(V_t, 0.0)
+
+        # PFE et EPE au temps t
         pfe_t = float(np.quantile(V_pos, q))
         epe_t = float(np.mean(V_pos))
 
+        # Stockage
         pfe[j - 1] = pfe_t
         epe[j - 1] = epe_t
 

@@ -9,6 +9,19 @@ from typing import Optional
 
 import streamlit as st
 
+# -----------------------------------------------------------------------------
+# Objectif de ce module
+# -----------------------------------------------------------------------------
+# Ce fichier fournit une mini couche "persistence" via SQLite pour :
+# - sauvegarder des runs (calibration HW1F/HW2F, PFE, artefacts, etc.)
+# - relister / relire / supprimer des runs
+# - sérialiser/désérialiser la courbe (Curve) afin de pouvoir reconstruire un run
+#
+# Points clés :
+# - DB locale dans streamlit_app/data/irlab.db
+# - list_runs est cache_data pour accélérer l’UI => on invalide le cache après écriture.
+# -----------------------------------------------------------------------------
+
 # Project root: .../streamlit_app/ui/db.py -> parents[2] = project root
 ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = ROOT / "streamlit_app" / "data"
@@ -16,10 +29,14 @@ DB_PATH = DATA_DIR / "irlab.db"
 
 
 def _utc_now_iso() -> str:
+    """Timestamp ISO en UTC (secondes) pour stocker un created_at stable."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _connect() -> sqlite3.Connection:
+    """
+    Ouvre une connexion SQLite.
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -27,6 +44,7 @@ def _connect() -> sqlite3.Connection:
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Retourne l’ensemble des colonnes d’une table (via PRAGMA table_info)."""
     cur = conn.cursor()
     cur.execute(f"PRAGMA table_info({table})")
     rows = cur.fetchall()
@@ -34,10 +52,17 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
 
 
 def init_db() -> None:
+    """
+    Initialise la base (idempotent) et applique des "soft migrations".
+
+    - Crée la table runs si absente
+    - Ajoute des colonnes manquantes si DB plus ancienne
+    - Crée quelques index utiles pour l’UI
+    """
     conn = _connect()
     cur = conn.cursor()
 
-    # Base table (new installs)
+    # Table de base 
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS runs (
@@ -45,18 +70,17 @@ def init_db() -> None:
             created_at TEXT NOT NULL,
             label TEXT,
             model TEXT NOT NULL,                 -- "HW1F" / "HW2F"
-            source_file TEXT,                    -- original uploaded filename (informational)
+            source_file TEXT,                    -- nom du xlsx uploadé (info)
             rmsre REAL,
-            curve_json TEXT NOT NULL,            -- serialized Curve snapshot
-            params_json TEXT NOT NULL,           -- serialized model parameters
-            artifacts_json TEXT,                 -- optional: PFE, etc.
-            notes TEXT,                          -- optional: user notes
-            meta_json TEXT                        -- optional: extra metadata
+            curve_json TEXT NOT NULL,            -- snapshot Curve sérialisé
+            params_json TEXT NOT NULL,           -- paramètres modèle sérialisés
+            artifacts_json TEXT,                 -- optionnel: PFE, etc.
+            notes TEXT,                          -- optionnel: notes user
+            meta_json TEXT                        -- optionnel: metadata extensible
         )
         """
     )
 
-    # Soft migrations for existing DBs created with an older schema
     cols = _table_columns(conn, "runs")
 
     def _add_col(name: str, ddl: str):
@@ -68,6 +92,7 @@ def init_db() -> None:
     _add_col("notes", "notes TEXT")
     _add_col("meta_json", "meta_json TEXT")
 
+    # Index (améliore la vitesse des listages/filtrages)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_runs_model ON runs(model)")
     conn.commit()
@@ -80,8 +105,12 @@ def init_db() -> None:
 
 def curve_to_dict(curve) -> dict:
     """
-    Minimal snapshot needed to reconstruct ir.market.curve.Curve.
-    Assumes curve has attributes: time, discount_factors, smooth.
+    Snapshot minimal pour reconstruire ir.market.curve.Curve.
+
+    Hypothèses:
+    - curve.time : array-like de maturités (années)
+    - curve.discount_factors : array-like de DF
+    - curve.smooth : paramètre de lissage spline (optionnel)
     """
     return {
         "time": [float(x) for x in getattr(curve, "time")],
@@ -91,7 +120,11 @@ def curve_to_dict(curve) -> dict:
 
 
 def curve_from_dict(d: dict):
-    from ir.market.curve import Curve  # local import to avoid early import issues
+    """
+    Reconstruit un objet Curve à partir du snapshot dict.
+    Import local pour éviter les soucis d’import au démarrage Streamlit.
+    """
+    from ir.market.curve import Curve  
 
     time = d.get("time", None)
     disc = d.get("discount_factors", None)
@@ -108,9 +141,13 @@ def curve_from_dict(d: dict):
 # -------------------------
 
 def _clear_runs_cache() -> None:
+    """
+    Invalidation du cache list_runs (Streamlit cache_data).
+    """
     try:
         list_runs.clear()  # type: ignore[attr-defined]
     except Exception:
+        # fallback global
         try:
             st.cache_data.clear()
         except Exception:
@@ -128,33 +165,32 @@ def save_run(
     params: dict,
     source_file: Optional[str] = None,
     rmsre: Optional[float] = None,
-    # New optional fields (for Portfolio Tracking UI)
     label: Optional[str] = None,
     artifacts: Optional[dict] = None,
     notes: Optional[str] = None,
     meta: Optional[dict] = None,
 ) -> int:
     """
-    Insert a run in DB and return its id.
+    Insère un run en base et retourne son id.
 
-    Backward compatible:
-    - label/artifacts/notes are optional (stored in columns if present, and also in meta_json).
     """
     model = str(model).strip()
     if model not in ("HW1F", "HW2F"):
-        raise ValueError("model must be 'HW1F' or 'HW2F'.")
+        raise ValueError("Le modèle doit être be 'HW1F' ou 'HW2F'.")
 
     if curve_snapshot is None:
-        raise ValueError("curve_snapshot is required (run a calibration first, or ensure last_curve_snapshot is set).")
+        raise ValueError(
+            "curve_snapshot est requis (run une première calibration, ou assurer que last_curve_snapshot is validé)."
+        )
 
     created_at = _utc_now_iso()
 
+    # Sérialisation JSON "safe" (UTF-8)
     curve_json = json.dumps(curve_snapshot, ensure_ascii=False)
     params_json = json.dumps(params or {}, ensure_ascii=False)
     artifacts_json = json.dumps(artifacts or {}, ensure_ascii=False)
     notes_txt = "" if notes is None else str(notes)
 
-    # merge meta
     meta_out = dict(meta or {})
     if label is not None:
         meta_out.setdefault("label", str(label))
@@ -205,7 +241,10 @@ def save_run(
 @st.cache_data(show_spinner=False)
 def list_runs(limit: int = 200) -> list[dict]:
     """
-    Return a list of runs (latest first), already parsed from JSON.
+    Liste les runs (ordre décroissant created_at) et retourne une liste de dicts.
+
+    Important:
+    - Cache Streamlit : accélère le rendu UI
     """
     conn = _connect()
     cur = conn.cursor()
@@ -269,6 +308,9 @@ def list_runs(limit: int = 200) -> list[dict]:
 
 
 def get_run(run_id: int) -> Optional[dict]:
+    """
+    Récupère un run par id (retourne le même format que list_runs, mais pour 1 seul).
+    """
     conn = _connect()
     cur = conn.cursor()
     cur.execute("SELECT * FROM runs WHERE id = ?", (int(run_id),))
@@ -321,6 +363,14 @@ def get_run(run_id: int) -> Optional[dict]:
 
 
 def delete_run(run_id: int) -> bool:
+    """
+    Supprime un run par id.
+
+    Returns
+    -------
+    bool
+        True si au moins une ligne supprimée, False sinon.
+    """
     conn = _connect()
     cur = conn.cursor()
     cur.execute("DELETE FROM runs WHERE id = ?", (int(run_id),))
@@ -333,6 +383,9 @@ def delete_run(run_id: int) -> bool:
 
 
 def format_run_label(run: dict) -> str:
+    """
+    Formate une ligne "lisible" pour afficher un run dans un selectbox Streamlit.
+    """
     rid = run.get("id", "?")
     ts = run.get("created_at", "")
     model = run.get("model", "?")
