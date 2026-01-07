@@ -76,7 +76,7 @@ Résumé des fonctionnalités principales de l’application.
 
 ### 6) Lancer le moteur en ligne de commande via un notebook
 
-Le script main.py exécute un run “console” :
+Le script test.ipynb exécute un run “console” :
 
 **Mode démo**
 ```bash
