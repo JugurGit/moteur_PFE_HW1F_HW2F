@@ -82,15 +82,7 @@ des calculs **reproductibles**, **comparables** et **auditables**, présentés v
     icon="✅",
 )
 
-with st.expander("🔎 Comment j’ai structuré l’approche (logique “production / audit”) ", expanded=False):
-    st.markdown(
-        """
-- **Séparation des responsabilités** : moteur/calculs (lib) vs **UI** (Streamlit) vs **stockage** (runs).  
-- **Paramètres explicites** : seeds, grilles, conventions, choix 1F/2F, quantiles PFE.  
-- **Diagnostics** : plots de calibration, erreurs, comparaisons inter-modèles.  
-- **Audit trail** : sauvegarde des runs (inputs + résultats + métadonnées) pour rejouer / comparer.  
-"""
-    )
+
 
 st.divider()
 
