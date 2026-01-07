@@ -1,4 +1,4 @@
-# IR Lab — Hull-White 1F / 2F (G2++) • Calibration • PFE (Streamlit)
+# Mémoire — Hull-White 1F / 2F (G2++) • Calibration • PFE (Streamlit)
 
 Application Streamlit multi-pages + librairie Python qui permet de :
 - **Charger une courbe** (discount factors) depuis un template Excel
@@ -11,6 +11,7 @@ Application Streamlit multi-pages + librairie Python qui permet de :
 
 > ⚠️ Projet à but illustratif : les conventions, paramètres par défaut et templates “demo” ne constituent pas une implémentation production/réglementaire.
 
+👉 Démo en ligne : **https://boudarene-moteurpfe.streamlit.app/**
 ---
 
 ## 1) Prérequis
