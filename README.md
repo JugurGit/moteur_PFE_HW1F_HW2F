@@ -9,7 +9,7 @@ Application Streamlit multi-pages + librairie Python qui permet de :
 - **Portfolio tracking mode** : logique d’historisation de runs (via SQLite, initialisée au démarrage)
 - **Documentation** : navigation dans le code depuis l’UI
 
-> ⚠️ Projet à but pédagogique / portfolio : les conventions, paramètres par défaut et templates “demo” ne constituent pas une implémentation production/réglementaire.
+> ⚠️ Projet à but illustratif : les conventions, paramètres par défaut et templates “demo” ne constituent pas une implémentation production/réglementaire.
 
 ---
 
@@ -47,6 +47,7 @@ Résumé des fonctionnalités principales de l’application.
 
 #### Calibration HW1F (page 2)
 - **Charger les données** :
+  - par défaut, des données de calibration de **swaption** sont déjà chargées 
   - uploader un template **swaption** `.xlsx`, **ou**
   - utiliser celui fourni dans le repo : `Calibration_Templates/`
 - **Lancer la calibration** des paramètres **(a, σ)**, puis consulter :
@@ -72,11 +73,11 @@ Résumé des fonctionnalités principales de l’application.
 - Activer / désactiver le mode via le toggle **📌 Portfolio tracking mode** dans la sidebar
 - Sauvegarder et consulter des **runs** (selon l’implémentation de la page tracking)
 
-### 6) Lancer le moteur en ligne de commande (sans Streamlit)
+### 6) Lancer le moteur en ligne de commande via un notebook
 
 Le script main.py exécute un run “console” :
 
 **Mode démo**
 ```bash
-python main.py
+python test.ipynb
 ```
